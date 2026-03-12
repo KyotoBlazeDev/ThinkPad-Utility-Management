@@ -385,7 +385,7 @@ This script runs entirely on the local machine. No data is transmitted, collecte
 
 Want to build your own ThinkPad diagnostic tool using the same architecture?
 
-[Open the Power User Guide](POWER_USER_GUIDE.md)
+[Open the Power User Guide](PowerUsers.md)
 
 ---
 
