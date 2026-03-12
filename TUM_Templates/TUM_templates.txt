@@ -1,0 +1,3189 @@
+Clear-Host
+
+# ── Administrator privilege check with auto-elevation ────────────────────
+# The root\wmi and root\Lenovo WMI namespaces communicate directly with the
+# system BIOS and Embedded Controller (EC). Windows restricts access to these
+# namespaces to Administrator-level processes to prevent unprivileged software
+# from reading or modifying firmware-level hardware state. Without elevation,
+# every WMI call in this script will fail mid-session with opaque access-denied
+# errors rather than surfacing a clear message to the user.
+#
+# When not running as Administrator, attempt to relaunch this script elevated
+# via a UAC prompt. If UAC is declined or unavailable, display a clear
+# explanation of why elevation is required before exiting.
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+
+    try {
+        $scriptPath = $MyInvocation.MyCommand.Path
+
+        # A resolved path is required to relaunch — the script must be saved to disk.
+        # Scripts piped into PowerShell or pasted into a console have no path and
+        # cannot be relaunched automatically.
+        if (-not $scriptPath) {
+            throw "Script path is unavailable. Save the script to a .ps1 file and run it directly."
+        }
+
+        # Trigger a UAC elevation prompt and relaunch this script in a new
+        # elevated PowerShell process. The current non-elevated instance exits
+        # immediately so two copies never run side by side.
+        Start-Process -FilePath "powershell.exe" `
+                      -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" `
+                      -Verb RunAs `
+                      -ErrorAction Stop
+        Exit
+
+    }
+    catch {
+        # Reached when: UAC was declined, UAC is disabled by policy, or the
+        # script path could not be resolved (pipe / unsaved buffer scenario).
+        Clear-Host
+        Write-Host ""
+        Write-Host "  ACCESS DENIED" -ForegroundColor Red
+        Write-Host ""
+
+        if ($_.Exception.Message -match "canceled by the user|was canceled") {
+            # User clicked "No" on the UAC prompt
+            Write-Host "  UAC elevation was cancelled." -ForegroundColor Yellow
+        }
+        else {
+            # Any other failure (policy block, missing path, etc.)
+            Write-Host "  Could not elevate automatically:" -ForegroundColor Yellow
+            Write-Host "  $($_.Exception.Message)" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "  Right-click PowerShell and select" -ForegroundColor Gray
+            Write-Host "  'Run as Administrator', then try again." -ForegroundColor Gray
+        }
+
+        Write-Host ""
+        Write-Host "  Why elevation is required:" -ForegroundColor Cyan
+        Write-Host "  This script reads data directly from your ThinkPad's BIOS and" -ForegroundColor Gray
+        Write-Host "  Embedded Controller (EC) via the root\wmi and root\Lenovo WMI" -ForegroundColor Gray
+        Write-Host "  namespaces. Windows restricts access to these interfaces to" -ForegroundColor Gray
+        Write-Host "  Administrator processes only, to prevent unprivileged software" -ForegroundColor Gray
+        Write-Host "  from reading or modifying firmware-level hardware state." -ForegroundColor Gray
+        Write-Host ""
+        Read-Host "  Press ENTER to exit"
+        Exit
+    }
+}
+
+$script:ErrorLog    = @()
+$script:SystemInfo  = $null
+$script:CimSession  = $null   # Shared CIM session — initialised after Show-Disclaimer
+$script:BatteryAlert = $null  # Cached battery alert state — populated by Get-BatteryAlertState
+
+
+function New-ScriptCimSession {
+    <#
+    .SYNOPSIS
+    Creates the shared CIM session stored in $script:CimSession and returns it.
+
+    .DESCRIPTION
+    A CIM session is a persistent, reusable connection to the local (or remote)
+    CIM infrastructure. By creating one session at startup and passing it via
+    -CimSession to every Get-CimInstance call, the script avoids the per-call
+    overhead of implicitly opening and closing a DCOM/WinRM transport each time.
+
+    Benefits:
+      - Faster repeated queries within the same script session
+      - Cleaner enterprise execution (single authenticated connection)
+      - Forward-compatible with remote ThinkPad management (change
+        New-CimSession -ComputerName to target a remote machine)
+
+    Graceful degradation: if New-CimSession fails for any reason (policy
+    restriction, WMI service issue), $script:CimSession is left as $null and
+    every Get-CimInstance call falls back to its implicit local session.
+    No function in this script checks for a null session before calling
+    Get-CimInstance — passing $null to -CimSession is equivalent to omitting it.
+    #>
+    try {
+        $script:CimSession = New-CimSession -ErrorAction Stop
+    }
+    catch {
+        # Non-fatal: log the failure and continue without a shared session.
+        # All Get-CimInstance calls will fall back to implicit local sessions.
+        $script:ErrorLog += [PSCustomObject]@{
+            TimeStamp        = Get-Date
+            Namespace        = 'local'
+            Class            = 'CimSession'
+            Message          = "New-CimSession failed: $($_.Exception.Message). Falling back to implicit per-call sessions."
+            StackTrace       = $_.Exception.StackTrace
+            ScriptName       = $_.InvocationInfo.ScriptName
+            ScriptLineNumber = $_.InvocationInfo.ScriptLineNumber
+            Context          = 'Session initialisation'
+            BatteryDetails   = $null
+            FullException    = $_
+        }
+    }
+}
+
+function Get-GenuineManufacturerList {
+    <#
+    .SYNOPSIS
+    Returns the list of genuine battery manufacturer name tokens used for
+    non-genuine detection in Get-BatteryClassification.
+
+    .DESCRIPTION
+    Tries to load the list from manufacturers.json in the same directory as
+    this script. If the file is missing, unreadable, or contains no entries,
+    falls back silently to the built-in hardcoded list so the script never
+    breaks due to a missing or malformed JSON file.
+
+    To extend detection without editing this script, add entries to the
+    genuineManufacturers array in manufacturers.json:
+      { "name": "NEWMFR", "fullName": "New Manufacturer Inc.", "region": "XX", "notes": "" }
+
+    The "name" field is matched case-insensitively as a substring against
+    BatteryStaticData.ManufactureName. Only the "name" field is required.
+    #>
+
+    # Built-in fallback list -- always used if JSON load fails for any reason
+    $builtIn = @(
+        "LENOVO",    # Lenovo-branded packs
+        "PANASONIC", # Historic OEM supplier (IBM/early Lenovo era)
+        "SANYO",     # Historic OEM supplier
+        "SONY",      # Historic OEM supplier
+        "MURATA",    # Sony battery division acquired by Murata in 2017
+        "LGC",       # LG Chem - common modern OEM supplier
+        "LG",        # LG Chem alternate short form reported by some firmware
+        "SDI",       # Samsung SDI
+        "SAMSUNG",   # Samsung SDI alternate form
+        "CELXPERT",  # Confirmed Lenovo-authorized supplier
+        "ATL",       # Amperex Technology Limited
+        "COSMX",     # Authorized supplier
+        "BYD",       # BYD battery division
+        "NVT",       # Authorized supplier
+        "SUNWODA",   # Confirmed Lenovo-authorized supplier
+        "SMP"        # Authorized supplier
+    )
+
+    # Resolve JSON path relative to this script file
+    $jsonPath = Join-Path $PSScriptRoot "manufacturers.json"
+
+    if (-not (Test-Path $jsonPath)) {
+        return $builtIn
+    }
+
+    try {
+        $data = Get-Content -Path $jsonPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+        $names = @($data.genuineManufacturers |
+                   Where-Object { $_.name -and $_.name.Trim() -ne "" } |
+                   Select-Object -ExpandProperty name)
+
+        if ($names.Count -gt 0) {
+            return $names
+        }
+        else {
+            Write-Warning "manufacturers.json contained no valid entries -- using built-in manufacturer list."
+            return $builtIn
+        }
+    }
+    catch {
+        Write-Warning "Failed to load manufacturers.json ($($_.Exception.Message)) -- using built-in manufacturer list."
+        return $builtIn
+    }
+}
+
+function Get-BatteryClassification {
+    param(
+        [object]$DesignCapacity,
+        [object]$FullChargeCapacity,
+        [object]$CycleCount,
+        [string]$BatteryStatus = "Unknown",
+        [string]$Manufacturer = "Unknown",
+
+        # Optional: pass a pre-computed health percentage to bypass the internal
+        # int64 capacity parse. Used by callers (e.g. Lenovo_Battery path) that
+        # receive capacity as localised decimal strings ("39,96Wh") and have
+        # already calculated the percentage themselves with double arithmetic.
+        # When supplied and > 0, DesignCapacity / FullChargeCapacity are ignored
+        # for the health calculation — all other logic (genuineness, cycle count,
+        # classification thresholds) still runs normally.
+        [double]$PrecomputedHealthPercent = 0
+    )
+
+    $HealthPercent = 0
+    $Classification = "Unknown"
+    $Severity = 3
+    $IsGenuine = $true
+    $FailureFlag = $false
+    $Message = ""
+
+    # Calculate health percentage
+    # If a pre-computed value was supplied, use it directly and skip the
+    # int64 capacity parse which would fail on decimal Wh strings.
+    if ($PrecomputedHealthPercent -gt 0) {
+        $HealthPercent = [math]::Round($PrecomputedHealthPercent, 2)
+    }
+    else {
+        [int64]$fc = 0
+        [int64]$dc = 0
+
+        if ($FullChargeCapacity -and $DesignCapacity -and
+        [int64]::TryParse([string]$FullChargeCapacity, [ref]$fc) -and
+        [int64]::TryParse([string]$DesignCapacity, [ref]$dc) -and
+        $dc -gt 0) {
+            $HealthPercent = [math]::Round(($fc / $dc) * 100, 2)
+        }
+        else {
+            $Message = "Unable to calculate health: invalid capacity values"
+            $Severity = 3
+            $FailureFlag = $true
+            return [PSCustomObject]@{
+                HealthPercent  = $HealthPercent
+                Classification = $Classification
+                Severity       = $Severity
+                IsGenuine      = $IsGenuine
+                FailureFlag    = $FailureFlag
+                Message        = $Message
+            }
+        }
+    }
+
+    # Detect non-genuine batteries
+    # Load manufacturer list from manufacturers.json (falls back to built-in list if missing)
+    $GenuineManufacturers = Get-GenuineManufacturerList
+    $IsGenuine = $false
+
+    if ($Manufacturer -and $Manufacturer -ne "Unknown" -and $Manufacturer -ne "N/A") {
+        $normalizedManufacturer = $Manufacturer.Trim().ToUpper()
+        foreach ($Genuine in $GenuineManufacturers) {
+            if ($normalizedManufacturer -match [regex]::Escape($Genuine.ToUpper())) {
+                $IsGenuine = $true
+                break
+            }
+        }
+    }
+
+    # Parse cycle count
+    [int64]$cycles = 0
+    if ($CycleCount) {
+        $cycleStr = $CycleCount.ToString() -replace '\D', ''
+        [int64]::TryParse($cycleStr, [ref]$cycles) | Out-Null
+    }
+
+    # Classify battery health and determine severity
+    # Check for critical conditions — any status outside the known-good set
+    # (or an explicit failure keyword) is treated as critical.
+    $isCriticalStatus = if ($BatteryStatus -and $BatteryStatus -ne "Unknown" -and $BatteryStatus -ne "N/A") {
+        $normalStates = @("OK", "Discharging", "Charging", "Unknown")
+        (-not ($normalStates -contains $BatteryStatus)) -or ($BatteryStatus -match "Failed|Critical|Error|Degraded")
+    } else {
+        $false
+    }
+
+    if ($isCriticalStatus -or $HealthPercent -lt 20 -or $cycles -gt 1500) {
+        $Classification = "Critical"
+        $Severity = 4
+        $FailureFlag = $true
+        $Message = "The battery reports a failure and needs to be replaced as soon as possible."
+    }
+    elseif ($HealthPercent -lt 40 -or ($cycles -gt 1000 -and $HealthPercent -lt 60)) {
+        $Classification = "Poor"
+        $Severity = 3
+        $Message = "Battery health is poor. Consider replacement soon."
+    }
+    elseif ($HealthPercent -lt 60 -or ($cycles -gt 500 -and $HealthPercent -lt 75)) {
+        $Classification = "Fair"
+        $Severity = 2
+        $Message = "The battery is functioning correctly, but due to normal aging of the battery, the battery life between charges is now significantly shorter than when it was new."
+    }
+    elseif ($HealthPercent -lt 80) {
+        # Warning tier — aligns with Lenovo Vantage's updated alert threshold.
+        # Vantage now flags batteries below 80% as needing attention.
+        # This tier surfaces the same early signal while keeping the existing
+        # Fair / Poor / Critical thresholds intact for backwards compatibility.
+        $Classification = "Warning"
+        $Severity = 1
+        $Message = "Battery health is below 80%. Lenovo Vantage recommends attention at this level. Monitor battery life and consider replacement if runtime becomes insufficient."
+    }
+    else {
+        $Classification = "Good"
+        $Severity = 0
+        $Message = "Battery health is good."
+    }
+
+    # Add genuineness warning to message
+    if (-not $IsGenuine) {
+        $Message += " Warning: The battery in use is not genuine Lenovo-made or authorized. Lenovo has no responsibility for the performance or safety of unauthorized batteries, and provides no warranties for failure or damage arising from their use."
+    }
+
+    return [PSCustomObject]@{
+        HealthPercent = $HealthPercent
+        Classification = $Classification
+        Severity = $Severity
+        IsGenuine = $IsGenuine
+        FailureFlag = $FailureFlag
+        Message = $Message
+    }
+}
+
+function Log-Error {
+    param($Namespace,$Class,$Exception)
+
+    $ExceptionMessage = $Exception.Exception.Message
+    $StackTrace = $Exception.Exception.StackTrace
+    $InvocationInfo = $Exception.InvocationInfo
+
+    $script:ErrorLog += [PSCustomObject]@{
+        TimeStamp       = Get-Date
+        Namespace       = $Namespace
+        Class           = $Class
+        Message         = $ExceptionMessage
+        StackTrace      = $StackTrace
+        ScriptName      = $InvocationInfo.ScriptName
+        ScriptLineNumber = $InvocationInfo.ScriptLineNumber
+        Context         = $null
+        BatteryDetails  = $null
+        FullException   = $Exception
+    }
+}
+
+function Log-BatteryError {
+    param($Namespace, $Class, $Exception, $BatteryIndex, $BatteryID, $BatteryDetails)
+
+    $ExceptionMessage = $Exception.Exception.Message
+    $StackTrace = $Exception.Exception.StackTrace
+    $InvocationInfo = $Exception.InvocationInfo
+
+    $contextString = "Battery Index: $BatteryIndex | Battery ID: $BatteryID"
+    if ($BatteryDetails) {
+        $contextString += " | InstanceName: $($BatteryDetails.InstanceName)"
+    }
+
+    $script:ErrorLog += [PSCustomObject]@{
+        TimeStamp        = Get-Date
+        Namespace        = $Namespace
+        Class            = $Class
+        Message          = $ExceptionMessage
+        StackTrace       = $StackTrace
+        ScriptName       = $InvocationInfo.ScriptName
+        ScriptLineNumber = $InvocationInfo.ScriptLineNumber
+        Context          = $contextString
+        BatteryDetails   = $BatteryDetails
+        FullException    = $Exception
+    }
+}
+
+
+function Get-SystemInfo {
+    <#
+    .SYNOPSIS
+    Queries Win32_ComputerSystem and Win32_BIOS once and caches the result
+    in $script:SystemInfo. Subsequent calls return the cached object.
+    #>
+    if ($script:SystemInfo) { return $script:SystemInfo }
+
+    $model       = "Unknown"
+    $biosVersion = "Unknown"
+    $biosDate    = "Unknown"
+
+    try {
+        $cs = Get-CimInstance -CimSession $script:CimSession -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+        if ($cs) {
+            # Win32_ComputerSystem.Model is the most reliable field for ThinkPad model strings
+            $model = "$($cs.Manufacturer) $($cs.Model)".Trim()
+        }
+    } catch {}
+
+    try {
+        $bios = Get-CimInstance -CimSession $script:CimSession -ClassName Win32_BIOS -ErrorAction SilentlyContinue
+        if ($bios) {
+            $biosVersion = $bios.SMBIOSBIOSVersion
+            # ReleaseDate is a CIM datetime — format to readable date
+            if ($bios.ReleaseDate) {
+                $biosDate = ([System.Management.ManagementDateTimeConverter]::ToDateTime($bios.ReleaseDate)).ToString("yyyy-MM-dd")
+            }
+        }
+    } catch {}
+
+    $script:SystemInfo = [PSCustomObject]@{
+        Model       = $model
+        BIOSVersion = $biosVersion
+        BIOSDate    = $biosDate
+    }
+
+    return $script:SystemInfo
+}
+
+
+function Get-LenovoDeviceFamily {
+    <#
+    .SYNOPSIS
+    Returns "ThinkPad" if this is a ThinkPad, otherwise "Other" or "Unknown".
+
+    .DESCRIPTION
+    The root\Lenovo WMI namespace is a ThinkPad-exclusive firmware feature.
+    It is not present on any other Lenovo product line (IdeaPad, Yoga, Legion,
+    IdeaCentre, ThinkBook, ThinkCentre, ThinkStation, etc.) by design —
+    this is a firmware architecture decision, not a driver or configuration issue.
+
+    Rather than enumerating every possible non-ThinkPad family name, the logic
+    is intentionally binary:
+      - "ThinkPad" : model string contains "ThinkPad" — namespace should be present
+      - "Other"    : any other Lenovo device — namespace is absent by design
+      - "Unknown"  : model string could not be read
+
+    Uses $script:SystemInfo (already cached by Get-SystemInfo) — no extra WMI query.
+    #>
+    $si = Get-SystemInfo
+    $model = $si.Model
+
+    if (-not $model -or $model -eq "Unknown") { return "Unknown" }
+
+    if ($model.ToUpper() -match "THINKPAD") { return "ThinkPad" }
+
+    return "Other"
+}
+
+function Get-LenovoNamespaceUnavailableMessage {
+    <#
+    .SYNOPSIS
+    Writes a device-aware explanation of why root\Lenovo is unavailable.
+
+    .DESCRIPTION
+    If this is a ThinkPad, the namespace should exist — absence means a driver
+    problem, so repair advice is shown.
+
+    If this is any other Lenovo device, root\Lenovo is absent by firmware design.
+    No driver install or WMI repair will fix this. The user is told clearly that
+    the feature is ThinkPad-exclusive and pointed to Lenovo Vantage instead.
+    #>
+    param(
+        [string]$Feature = "this feature"
+    )
+
+    $family       = Get-LenovoDeviceFamily
+    $sifInstalled = Test-SifInstalled
+    $si           = Get-SystemInfo
+
+    switch ($family) {
+        "ThinkPad" {
+            # ThinkPad — namespace should be present, absence is a driver problem
+            Write-Host "root\Lenovo namespace not available." -ForegroundColor Red
+            Write-Host ""
+            if ($sifInstalled) {
+                Write-Host "Lenovo System Interface Foundation (SIF) appears to be installed," -ForegroundColor Yellow
+                Write-Host "but the root\Lenovo WMI namespace was not found." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "Try:" -ForegroundColor Yellow
+                Write-Host "  1. Restart the WMI service:  Restart-Service winmgmt"
+                Write-Host "  2. Re-register the provider: mofcomp.exe"
+                Write-Host "  3. Reinstall SIF from support.lenovo.com -> Drivers & Software"
+            } else {
+                Write-Host "Lenovo System Interface Foundation (SIF) is not installed." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "SIF registers the root\Lenovo WMI namespace used for $Feature." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "Install SIF from Lenovo Support:" -ForegroundColor Cyan
+                Write-Host "  support.lenovo.com  ->  Drivers & Software"
+                Write-Host "  Search: 'System Interface Foundation'"
+            }
+        }
+
+        "Other" {
+            # Any non-ThinkPad Lenovo device — absent by firmware design
+            Write-Host "root\Lenovo namespace is not available on this device." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Device: $($si.Model)" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "The Lenovo EC WMI interface used for $Feature is a" -ForegroundColor Yellow
+            Write-Host "ThinkPad-exclusive firmware feature. It is not present on" -ForegroundColor Yellow
+            Write-Host "other Lenovo devices by design — this is not a driver or" -ForegroundColor Yellow
+            Write-Host "configuration issue and cannot be resolved by installing SIF." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "For battery and system information on this device," -ForegroundColor Cyan
+            Write-Host "use the Lenovo Vantage app (available in the Microsoft Store)." -ForegroundColor Cyan
+        }
+
+        default {
+            # Model string unreadable — generic fallback
+            Write-Host "root\Lenovo namespace is not available on this system." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "This interface is only supported on Lenovo ThinkPad systems." -ForegroundColor Yellow
+        }
+    }
+}
+
+function Get-BatteryAlertState {
+    <#
+    .SYNOPSIS
+    Queries all batteries at startup and caches per-battery health results in
+    $script:BatteryAlert. Subsequent calls return the cached object.
+
+    .DESCRIPTION
+    Most users only open this script after something has already gone wrong —
+    the laptop dies unexpectedly, shuts off mid-use, or won't charge past a
+    low percentage. By querying health at startup and surfacing a summary in
+    the header and menu on every screen, the alert is impossible to miss even
+    for users who don't know which menu option to pick.
+
+    PowerBridge ThinkPads (T440, T450, T460, W540 series and similar) have two
+    batteries — an internal fixed cell and a hot-swappable external bay battery.
+    Both are tracked individually so degradation on either one is reported
+    correctly rather than masked by the other.
+
+    Sources tried in order (mirrors the FullCharge function priority):
+      1. Lenovo_Battery (root\Lenovo) — richest data, preferred when SIF present
+      2. BatteryFullChargedCapacity + BatteryStaticData (root\wmi ACPI fallback)
+
+    Returns a PSCustomObject with:
+      Batteries      : array of per-battery results (Index, BatteryID,
+                       Severity, Classification, HealthPercent)
+      WorstSeverity  : highest Severity across all batteries
+      SummaryLine    : pre-formatted summary string for Show-Header
+      BatteryCount   : total number of batteries detected
+      Available      : $true if health data was found for at least one battery
+    #>
+    if ($script:BatteryAlert) { return $script:BatteryAlert }
+
+    $result = [PSCustomObject]@{
+        Batteries     = @()
+        WorstSeverity = 0
+        SummaryLine   = ""
+        BatteryCount  = 0
+        Available     = $false
+    }
+
+    # ── Source 1: Lenovo_Battery ─────────────────────────────────────────
+    if ((Test-LenovoNamespace) -and (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Battery")) {
+        try {
+            $lbBatteries = @(Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Battery -ErrorAction Stop)
+            if ($lbBatteries -and $lbBatteries.Count -gt 0) {
+                $index = 0
+                foreach ($lb in $lbBatteries) {
+                    $batteryID = Get-SafeWmiProperty -Object $lb -PropertyName "BatteryID"
+                    $lbDesign  = Get-SafeWmiProperty -Object $lb -PropertyName "DesignCapacity"
+                    $lbFull    = Get-SafeWmiProperty -Object $lb -PropertyName "FullChargeCapacity"
+                    $lbCycles  = Get-SafeWmiProperty -Object $lb -PropertyName "CycleCount"
+                    $mfr       = Get-SafeWmiProperty -Object $lb -PropertyName "Manufacturer"
+
+                    $dcStr = ($lbDesign -replace '[^0-9,\.]','') -replace ',','.'
+                    $fcStr = ($lbFull   -replace '[^0-9,\.]','') -replace ',','.'
+                    [double]$dcNum = 0; [double]$fcNum = 0
+                    $healthPct = 0
+                    if ([double]::TryParse($dcStr, [System.Globalization.NumberStyles]::Any,
+                            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dcNum) -and
+                        [double]::TryParse($fcStr, [System.Globalization.NumberStyles]::Any,
+                            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$fcNum) -and
+                        $dcNum -gt 0) {
+                        $healthPct = [math]::Round(($fcNum / $dcNum) * 100, 2)
+                    }
+
+                    $c = Get-BatteryClassification `
+                        -PrecomputedHealthPercent $healthPct `
+                        -CycleCount               $lbCycles `
+                        -Manufacturer             $(if ($mfr -and $mfr -ne "Unavailable") { $mfr } else { "Unknown" })
+
+                    $result.Batteries += [PSCustomObject]@{
+                        Index          = $index
+                        BatteryID      = $batteryID
+                        Severity       = $c.Severity
+                        Classification = $c.Classification
+                        HealthPercent  = $healthPct
+                    }
+
+                    if ($c.Severity -gt $result.WorstSeverity) {
+                        $result.WorstSeverity = $c.Severity
+                    }
+
+                    $index++
+                }
+
+                if ($result.Batteries.Count -gt 0) {
+                    $result.BatteryCount = $result.Batteries.Count
+                    $result.Available    = $true
+                    $script:BatteryAlert = $result
+                    $script:BatteryAlert = Set-BatteryAlertSummary $result
+                    return $script:BatteryAlert
+                }
+            }
+        } catch {}
+    }
+
+    # ── Source 2: ACPI BatteryFullChargedCapacity ────────────────────────
+    try {
+        $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+        if ($batteries -and $batteries.Count -gt 0) {
+            $index = 0
+            foreach ($bat in $batteries) {
+                $fc  = Get-SafeWmiProperty -Object $bat -PropertyName "FullChargedCapacity"
+                $dc  = Get-DesignCapacity -Index $index
+                $mfr = Get-BatteryManufacturer -Index $index
+
+                $c = Get-BatteryClassification `
+                    -DesignCapacity     $dc `
+                    -FullChargeCapacity $fc `
+                    -CycleCount         $null `
+                    -Manufacturer       $(if ($mfr) { $mfr } else { "Unknown" })
+
+                $result.Batteries += [PSCustomObject]@{
+                    Index          = $index
+                    BatteryID      = "Battery $index"
+                    Severity       = $c.Severity
+                    Classification = $c.Classification
+                    HealthPercent  = $c.HealthPercent
+                }
+
+                if ($c.Severity -gt $result.WorstSeverity) {
+                    $result.WorstSeverity = $c.Severity
+                }
+
+                $index++
+            }
+
+            if ($result.Batteries.Count -gt 0) {
+                $result.BatteryCount = $result.Batteries.Count
+                $result.Available    = $true
+            }
+        }
+    } catch {}
+
+    $script:BatteryAlert = Set-BatteryAlertSummary $result
+    return $script:BatteryAlert
+}
+
+function Set-BatteryAlertSummary {
+    <#
+    .SYNOPSIS
+    Builds the summary line for Show-Header from the per-battery results array.
+
+    .DESCRIPTION
+    Single battery  : "Battery 0: Good (91%)"
+    Dual battery    : "Battery 0: Good (91%)  |  Battery 1: Poor (52%)"
+    Any count       : each battery appended with " | " separator
+
+    Only batteries with Severity >= 1 are coloured in the header — the summary
+    string itself is plain text; colouring is applied by Show-Header per token.
+    #>
+    param([object]$AlertState)
+
+    if (-not $AlertState.Available -or $AlertState.Batteries.Count -eq 0) {
+        $AlertState.SummaryLine = ""
+        return $AlertState
+    }
+
+    $parts = @()
+    foreach ($b in $AlertState.Batteries) {
+        $label = if ($b.BatteryID -and $b.BatteryID -ne "Unavailable") {
+            $b.BatteryID
+        } else {
+            "Battery $($b.Index)"
+        }
+        $parts += "$label`: $($b.Classification) ($($b.HealthPercent)%)"
+    }
+
+    $AlertState.SummaryLine = $parts -join "  |  "
+    return $AlertState
+}
+
+
+
+function Show-Header {
+    Clear-Host
+    $si = Get-SystemInfo
+    Write-Host "==============================================="
+    Write-Host "  THINKPAD UTILITY MANAGEMENT DASHBOARD V.1.1"
+    Write-Host "==============================================="
+    Write-Host "Device : $env:COMPUTERNAME"
+    Write-Host "Model  : $($si.Model)"
+    Write-Host "BIOS   : $($si.BIOSVersion)  ($($si.BIOSDate))"
+
+    # ── Battery summary line ─────────────────────────────────────────────
+    # Shown on every screen. On PowerBridge ThinkPads with two batteries,
+    # each battery is shown individually so degradation on either one is
+    # immediately visible without navigating into any menu option.
+    # Format: "Battery 0: Good (91%)  |  Battery 1: Poor (52%)"
+    # Each token is coloured by its own severity — good batteries stay white,
+    # degraded ones are highlighted so the problem stands out at a glance.
+    if ($script:BatteryAlert -and $script:BatteryAlert.Available) {
+        Write-Host "Battery: " -NoNewline
+        $tokens = $script:BatteryAlert.Batteries
+        for ($i = 0; $i -lt $tokens.Count; $i++) {
+            $b = $tokens[$i]
+            $bColor = switch ($b.Severity) {
+                0 { "White" }; 1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
+                default { "White" }
+            }
+            $label = if ($b.BatteryID -and $b.BatteryID -ne "Unavailable") {
+                $b.BatteryID
+            } else {
+                "Battery $($b.Index)"
+            }
+            Write-Host "$label`: $($b.Classification) ($($b.HealthPercent)%)" -ForegroundColor $bColor -NoNewline
+            if ($i -lt $tokens.Count - 1) { Write-Host "  |  " -NoNewline }
+        }
+        # Append action hint if any battery needs attention
+        if ($script:BatteryAlert.WorstSeverity -ge 1) {
+            Write-Host "  [Options 4 or 5]" -ForegroundColor DarkGray
+        } else {
+            Write-Host ""
+        }
+    }
+
+    if ($script:ErrorLog.Count -gt 0) {
+        Write-Host "Errors : " -NoNewline
+        Write-Host "$($script:ErrorLog.Count) error(s) logged this session  [Option 13 to view]" -ForegroundColor Red
+    }
+    Write-Host ""
+}
+
+function Show-Disclaimer {
+    Clear-Host
+    Write-Host "===============================================" -ForegroundColor Yellow
+    Write-Host "DISCLAIMER" -ForegroundColor Yellow
+    Write-Host "===============================================" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "This diagnostic script uses publicly available Windows and ACPI interfaces to read system information. Some optional data sources referenced by the script—such as community forums, blogs, Discord servers, or third‑party utilities—are not Lenovo‑official resources."
+    Write-Host ""
+    Write-Host "Lenovo is not responsible for moderating, maintaining, or validating external tools like fan Discord servers, blogs, forums, social media, and other similar services."
+    Write-Host ""
+    Write-Host "This project utilizes publicly documented Lenovo WMI interfaces available on supported ThinkPad systems."
+    Write-Host ""
+    Write-Host "This script is provided for educational and diagnostic purposes only. Unauthorized modifications or firmware may adversely affect warranty coverage."
+    Write-Host "This project is not affiliated with or endorsed by Lenovo."
+    Write-Host ""
+    Write-Host "ThinkPad is a trademark of Lenovo."
+    Write-Host ""
+    Write-Host "You must choose to Accept to continue. You may Exit without accepting if you do not agree."
+    Write-Host ""
+    do {
+        $response = Read-Host "Type 'A' to Accept and continue, or 'E' to Exit without accepting"
+        if ($null -ne $response) {
+            switch ($response.Trim().ToUpper()) {
+                "A" { return }          # proceed with script
+                "E" { Clear-Host; Write-Host "Exiting..."; Exit } # exit immediately
+                default { Write-Host "Invalid selection. Please enter 'A' or 'E'." -ForegroundColor Yellow }
+            }
+        }
+        else {
+            Write-Host "Invalid selection. Please enter 'A' or 'E'." -ForegroundColor Yellow
+        }
+    } while ($true)
+}
+
+function Get-DesignCapacity {
+    <#
+    .SYNOPSIS
+    Retrieves battery design capacity using multiple fallback sources.
+    Returns the design capacity as a string, or $null if not found.
+
+    Sources tried in order:
+      1. BatteryStaticData via Get-WmiObject (MUST use WmiObject - CimInstance fails on this class)
+      2. powercfg /batteryreport /XML (most reliable universal fallback)
+    #>
+    param([int]$Index = 0)
+
+    # Source 1: BatteryStaticData - MUST use Get-WmiObject, Get-CimInstance throws generic failure on this class
+    try {
+        $staticItems = @(Get-WmiObject -Namespace root\wmi -Class BatteryStaticData -ErrorAction SilentlyContinue)
+        if ($staticItems -and $Index -lt $staticItems.Count) {
+            $val = $staticItems[$Index].DesignedCapacity
+            if ($null -ne $val -and $val -gt 0) {
+                return [string]$val
+            }
+        }
+    } catch {}
+
+    # Source 2: powercfg /batteryreport /XML
+    try {
+        $xmlPath = Join-Path $env:TEMP "battery_tmp_$PID.xml"
+        $null = & powercfg /batteryreport /XML /OUTPUT $xmlPath 2>$null
+        if (Test-Path $xmlPath) {
+            [xml]$report = Get-Content $xmlPath -ErrorAction SilentlyContinue
+            Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+            $batteries = $report.BatteryReport.Batteries.Battery
+            # batteries may be single object or array
+            if ($batteries) {
+                $batArray = @($batteries)
+                if ($Index -lt $batArray.Count) {
+                    $val = $batArray[$Index].DesignCapacity
+                    if ($val -and [int64]$val -gt 0) {
+                        return [string]$val
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    return $null
+}
+
+function Get-BatteryManufacturer {
+    <#
+    .SYNOPSIS
+    Retrieves battery manufacturer using multiple fallback sources.
+    Returns the manufacturer string, or $null if not found.
+
+    Sources tried in order:
+      1. BatteryStaticData.ManufactureName via Get-WmiObject (MUST use WmiObject - CimInstance fails on this class)
+      2. Win32_Battery.Manufacturer via Get-CimInstance (widely available fallback)
+    #>
+    param([int]$Index = 0)
+
+    # Source 1: BatteryStaticData - MUST use Get-WmiObject
+    try {
+        $staticItems = @(Get-WmiObject -Namespace root\wmi -Class BatteryStaticData -ErrorAction SilentlyContinue)
+        if ($staticItems -and $Index -lt $staticItems.Count) {
+            $val = $staticItems[$Index].ManufactureName
+            if ($val -and $val.Trim() -ne "") {
+                return $val.Trim()
+            }
+        }
+    } catch {}
+
+    # Source 2: Win32_Battery.Manufacturer
+    try {
+        $win32Items = @(Get-CimInstance -CimSession $script:CimSession -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+        if ($win32Items -and $Index -lt $win32Items.Count) {
+            $val = $win32Items[$Index].Manufacturer
+            if ($val -and $val.Trim() -ne "") {
+                return $val.Trim()
+            }
+        }
+    } catch {}
+
+    return $null
+}
+
+function BatteryStaticData {
+    Show-Header
+    Write-Host "[ Battery Static Data - root\wmi ]"
+    Write-Host ""
+
+    try {
+        if (-not (Test-WmiClass -Namespace "root\wmi" -ClassName "BatteryStaticData")) {
+            Write-Host "BatteryStaticData class not available on this system." -ForegroundColor Yellow
+            Read-Host "Press ENTER"
+            return
+        }
+
+        $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryStaticData -ErrorAction SilentlyContinue)
+
+        if (-not $batteries -or $batteries.Count -eq 0) {
+            Write-Host "No batteries found." -ForegroundColor Yellow
+        }
+        else {
+            $index = 0
+            foreach ($bat in $batteries) {
+                try {
+                    $deviceID = Get-SafeWmiProperty -Object $bat -PropertyName "DeviceID"
+                    $manufacturer = Get-SafeWmiProperty -Object $bat -PropertyName "ManufactureName"
+                    $serial = Get-SafeWmiProperty -Object $bat -PropertyName "SerialNumber"
+                    $designCapacity = Get-SafeWmiProperty -Object $bat -PropertyName "DesignedCapacity"
+
+                    Write-Host "Battery #: $deviceID"
+                    Write-Host ("-" * 50)
+                    Write-Host "Manufacturer         : $manufacturer"
+                    Write-Host "Serial Number        : $serial"
+                    Write-Host "Designed Capacity    : $designCapacity"
+                    
+                    Write-Host ""
+                    $index++
+                }
+                catch {
+                    Log-BatteryError "root\wmi" "BatteryStaticData" $_ $index $($bat.DeviceID) $null
+                    Write-Host "Battery processing failed." -ForegroundColor Red
+                    Write-Host ""
+                    $index++
+                }
+            }
+        }
+    }
+    catch {
+        Log-Error "root\wmi" "BatteryStaticData" $_
+        Write-Host "Failed to query battery information." -ForegroundColor Red
+    }
+
+    Read-Host "Press ENTER"
+}
+
+function LenovoEC {
+    Show-Header
+    Write-Host "[ Lenovo EC - Lenovo_Odometer ]"
+    Write-Host ""
+
+    if (-not (Test-LenovoNamespace)) {
+        Get-LenovoNamespaceUnavailableMessage -Feature "battery cycle count and EC data"
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    try {
+        $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
+        $cycles = ([string]$odo.Battery_cycles -replace '\D','')
+
+        Write-Host "Cycle Count : $cycles"
+        Write-Host "Shock Events: $($odo.Shock_events)"
+        Write-Host "Thermal     : $($odo.Thermal_events)"
+    }
+    catch {
+        Log-Error "root\Lenovo" "Lenovo_Odometer" $_
+        Write-Host "Lenovo_Odometer not accessible." -ForegroundColor Red
+    }
+
+    Read-Host "Press ENTER"
+}
+
+function WarrantyInfo {
+    Show-Header
+    Write-Host "[ Warranty - Lenovo_WarrantyInformation ]"
+    Write-Host ""
+
+    if (-not (Test-LenovoNamespace)) {
+        Get-LenovoNamespaceUnavailableMessage -Feature "warranty information"
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    try {
+        $w = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_WarrantyInformation -ErrorAction Stop
+
+        Write-Host "Serial : $($w.SerialNumber)"
+        Write-Host "Start  : $($w.StartDate)"
+        Write-Host "End    : $($w.EndDate)"
+        Write-Host "Last Sync : $($w.LastUpdateTime)"
+    }
+    catch {
+        Log-Error "root\Lenovo" "Lenovo_WarrantyInformation" $_
+        Write-Host "Warranty data unavailable." -ForegroundColor Red
+    }
+
+    Read-Host "Press ENTER"
+}
+
+function FullCharge {
+    Show-Header
+    Write-Host "[ Battery Information ]"
+    Write-Host ""
+
+    # ── Source priority ──────────────────────────────────────────────────
+    # Lenovo_Battery (root\Lenovo) is tried first. It is available on systems
+    # with SIF installed and exposes the full set of Lenovo battery properties:
+    # identity, health classification, charge state, electrical readings, and
+    # firmware metadata in one class.
+    #
+    # If Lenovo_Battery is unavailable (SIF not installed, older firmware, or
+    # non-Lenovo battery controller), the function falls back to the original
+    # ACPI-based BatteryFullChargedCapacity path which works on any Windows system.
+
+    $usedLenovoBattery = $false
+
+    if ((Test-LenovoNamespace) -and (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Battery")) {
+        try {
+            $lbBatteries = @(Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Battery -ErrorAction Stop)
+
+            if ($lbBatteries -and $lbBatteries.Count -gt 0) {
+                $usedLenovoBattery = $true
+                Write-Host "Source: Lenovo_Battery (root\Lenovo)" -ForegroundColor DarkGray
+                Write-Host ""
+
+                $index = 0
+                foreach ($lb in $lbBatteries) {
+                    try {
+                        Write-Host "Battery #: $($lb.BatteryID)"
+                        Write-Host ("=" * 50)
+
+                        # ── Identity ─────────────────────────────────────────
+                        Write-Host "[ Identity ]"
+                        Write-Host "  Manufacturer         : $(Get-SafeWmiProperty -Object $lb -PropertyName 'Manufacturer')"
+                        Write-Host "  FRU Part Number      : $(Get-SafeWmiProperty -Object $lb -PropertyName 'FRUPartNumber')"
+                        Write-Host "  Barcode              : $(Get-SafeWmiProperty -Object $lb -PropertyName 'BarCode')"
+                        Write-Host "  Device Chemistry     : $(Get-SafeWmiProperty -Object $lb -PropertyName 'DeviceChemistry')"
+                        Write-Host "  Firmware Version     : $(Get-SafeWmiProperty -Object $lb -PropertyName 'FirmwareVersion')"
+                        Write-Host "  Manufacture Date     : $(Get-SafeWmiProperty -Object $lb -PropertyName 'ManufactureDate')"
+                        Write-Host "  First Use Date       : $(Get-SafeWmiProperty -Object $lb -PropertyName 'FirstUseDate')"
+                        Write-Host ""
+
+                        # ── Health ───────────────────────────────────────────
+                        Write-Host "[ Health ]"
+                        $lbHealth     = Get-SafeWmiProperty -Object $lb -PropertyName "BatteryHealth"
+                        $lbCondition  = Get-SafeWmiProperty -Object $lb -PropertyName "Condition"
+                        $lbCycles     = Get-SafeWmiProperty -Object $lb -PropertyName "CycleCount"
+                        $lbDesign     = Get-SafeWmiProperty -Object $lb -PropertyName "DesignCapacity"
+                        $lbFull       = Get-SafeWmiProperty -Object $lb -PropertyName "FullChargeCapacity"
+
+                        $healthColor = switch -Wildcard ($lbHealth.ToString().ToLower()) {
+                            "green"  { "Green"   }
+                            "yellow" { "Yellow"  }
+                            "red"    { "Red"     }
+                            default  { "White"   }
+                        }
+
+                        Write-Host "  Battery Health       : " -NoNewline
+                        Write-Host $lbHealth -ForegroundColor $healthColor
+                        Write-Host "  Condition            : $lbCondition"
+                        Write-Host "  Cycle Count          : $lbCycles"
+                        Write-Host "  Design Capacity      : $lbDesign"
+                        Write-Host "  Full Charge Capacity : $lbFull"
+                        Write-Host "  Design Voltage       : $(Get-SafeWmiProperty -Object $lb -PropertyName 'DesignVoltage')"
+
+                        # Calculate numeric health % if both capacity values are parseable
+                        # Lenovo_Battery reports capacity as strings like "39,96Wh" — strip non-numeric
+                        $healthPct = 0
+                        $dcStr = ($lbDesign  -replace '[^0-9,\.]','') -replace ',','.'
+                        $fcStr = ($lbFull    -replace '[^0-9,\.]','') -replace ',','.'
+                        [double]$dcNum = 0
+                        [double]$fcNum = 0
+                        if ([double]::TryParse($dcStr, [System.Globalization.NumberStyles]::Any,
+                                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dcNum) -and
+                            [double]::TryParse($fcStr, [System.Globalization.NumberStyles]::Any,
+                                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$fcNum) -and
+                            $dcNum -gt 0) {
+                            $healthPct = [math]::Round(($fcNum / $dcNum) * 100, 2)
+                            Write-Host "  Health %             : " -NoNewline
+                            Write-Host "$healthPct%" -ForegroundColor $(if ($healthPct -ge 80) { "Green" } elseif ($healthPct -ge 60) { "Cyan" } elseif ($healthPct -ge 40) { "Yellow" } elseif ($healthPct -ge 20) { "Magenta" } else { "Red" })
+                        }
+                        Write-Host ""
+
+                        # ── Charge State ─────────────────────────────────────
+                        Write-Host "[ Charge State ]"
+                        $lbStatus  = Get-SafeWmiProperty -Object $lb -PropertyName "Status"
+                        $statusColor = switch -Wildcard ($lbStatus.ToString().ToLower()) {
+                            "charging"     { "Green"  }
+                            "discharging"  { "Yellow" }
+                            "idle"         { "Cyan"   }
+                            default        { "White"  }
+                        }
+                        Write-Host "  Status               : " -NoNewline
+                        Write-Host $lbStatus -ForegroundColor $statusColor
+                        Write-Host "  Remaining Capacity   : $(Get-SafeWmiProperty -Object $lb -PropertyName 'RemainingCapacity')"
+                        Write-Host "  Remaining Percentage : $(Get-SafeWmiProperty -Object $lb -PropertyName 'RemainingPercentage')"
+                        Write-Host "  Remaining Time       : $(Get-SafeWmiProperty -Object $lb -PropertyName 'RemainingTime')"
+                        Write-Host "  Charge Completion    : $(Get-SafeWmiProperty -Object $lb -PropertyName 'ChargeCompletionTime')"
+                        Write-Host "  Adapter              : $(Get-SafeWmiProperty -Object $lb -PropertyName 'Adapter')"
+                        Write-Host ""
+
+                        # ── Electrical ───────────────────────────────────────
+                        Write-Host "[ Electrical ]"
+                        Write-Host "  Voltage              : $(Get-SafeWmiProperty -Object $lb -PropertyName 'Voltage')"
+                        Write-Host "  Wattage              : $(Get-SafeWmiProperty -Object $lb -PropertyName 'Wattage')"
+                        Write-Host "  Temperature          : $(Get-SafeWmiProperty -Object $lb -PropertyName 'Temperature')"
+                        Write-Host ""
+
+                        # ── Classification ───────────────────────────────────
+                        # Feed Lenovo_Battery data into the shared classification
+                        # engine so severity, genuineness, and alert flags are
+                        # consistent with the rest of the script.
+                        $mfr = Get-SafeWmiProperty -Object $lb -PropertyName "Manufacturer"
+                        $classification = Get-BatteryClassification `
+                            -PrecomputedHealthPercent $healthPct `
+                            -CycleCount               $lbCycles `
+                            -Manufacturer             $(if ($mfr -and $mfr -ne "Unavailable") { $mfr } else { "Unknown" })
+
+                        $severityColor = switch ($classification.Severity) {
+                            0 { "Green" }; 1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
+                            default { "White" }
+                        }
+
+                        Write-Host "[ Classification ]"
+                        Write-Host "  Classification       : " -NoNewline
+                        Write-Host $classification.Classification -ForegroundColor $severityColor
+                        Write-Host "  Status               : " -NoNewline
+                        Write-Host $classification.Message -ForegroundColor $severityColor
+
+                        if (-not $classification.IsGenuine) {
+                            Write-Host "  WARNING: Non-genuine battery detected" -ForegroundColor Red
+                        }
+                        if ($classification.FailureFlag) {
+                            Write-Host "  ALERT: Battery replacement needed immediately!" -ForegroundColor Red
+                        }
+
+                        Write-Host ""
+                        $index++
+                    }
+                    catch {
+                        Log-BatteryError "root\Lenovo" "Lenovo_Battery" $_ $index $($lb.BatteryID) $null
+                        Write-Host "Battery #: $index - FAILED" -ForegroundColor Red
+                        Write-Host ""
+                        $index++
+                    }
+                }
+            }
+        }
+        catch {
+            Log-Error "root\Lenovo" "Lenovo_Battery" $_
+            Write-Host "Lenovo_Battery query failed — falling back to ACPI source." -ForegroundColor Yellow
+            Write-Host ""
+        }
+    }
+
+    # ── ACPI fallback ────────────────────────────────────────────────────
+    # Used when Lenovo_Battery is unavailable: SIF not installed, older
+    # firmware, or the Lenovo_Battery query above failed.
+    if (-not $usedLenovoBattery) {
+        try {
+            if (-not (Test-WmiClass -Namespace "root\wmi" -ClassName "BatteryFullChargedCapacity")) {
+                Write-Host "Neither Lenovo_Battery nor BatteryFullChargedCapacity is available." -ForegroundColor Yellow
+                Write-Host "Install Lenovo SIF drivers for full battery data." -ForegroundColor Yellow
+                Read-Host "Press ENTER"
+                return
+            }
+
+            $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+
+            if (-not $batteries -or $batteries.Count -eq 0) {
+                Write-Host "No battery capacity data found." -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "Source: BatteryFullChargedCapacity (root\wmi) — ACPI fallback" -ForegroundColor DarkGray
+                Write-Host ""
+
+                $index = 0
+                foreach ($bat in $batteries) {
+                    try {
+                        $FullCharge     = Get-SafeWmiProperty -Object $bat -PropertyName "FullChargedCapacity"
+                        $DesignCapValue = Get-DesignCapacity -Index $index
+                        $Manufacturer   = Get-BatteryManufacturer -Index $index
+
+                        $DesignCap = if ($DesignCapValue) { $DesignCapValue } else { "Unavailable" }
+                        $Health    = "Unavailable"
+
+                        [int64]$fc = 0
+                        [int64]$dc = 0
+                        if ($null -ne $DesignCapValue -and
+                            [int64]::TryParse($FullCharge.ToString(), [ref]$fc) -and
+                            [int64]::TryParse($DesignCapValue.ToString(), [ref]$dc) -and
+                            $dc -gt 0) {
+                            $Health = [math]::Round(($fc / $dc) * 100, 2)
+                        }
+
+                        Write-Host "Battery #: $index"
+                        Write-Host ("-" * 50)
+                        Write-Host "Instance Name        : $($bat.InstanceName)"
+                        Write-Host "Manufacturer         : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })"
+                        Write-Host "Full Charge Capacity : $FullCharge mWh"
+                        Write-Host "Design Capacity      : $DesignCap mWh"
+                        Write-Host "Health %             : $Health"
+
+                        $classification = Get-BatteryClassification `
+                            -DesignCapacity     $DesignCapValue `
+                            -FullChargeCapacity $FullCharge `
+                            -CycleCount         $null `
+                            -Manufacturer       $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })
+
+                        $severityColor = switch ($classification.Severity) {
+                            0 { "Green" }; 1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
+                            default { "White" }
+                        }
+
+                        Write-Host "Classification       : " -NoNewline
+                        Write-Host $classification.Classification -ForegroundColor $severityColor
+                        Write-Host "Status               : " -NoNewline
+                        Write-Host $classification.Message -ForegroundColor $severityColor
+
+                        if (-not $classification.IsGenuine) {
+                            Write-Host "WARNING: Non-genuine battery detected" -ForegroundColor Red
+                        }
+                        if ($classification.FailureFlag) {
+                            Write-Host "ALERT: Battery replacement needed immediately!" -ForegroundColor Red
+                        }
+
+                        Write-Host ""
+                        $index++
+                    }
+                    catch {
+                        Log-BatteryError "root\wmi" "BatteryFullChargedCapacity" $_ $index $($bat.InstanceName) $null
+                        Write-Host "Battery #: $index - FAILED" -ForegroundColor Red
+                        Write-Host ""
+                        $index++
+                    }
+                }
+            }
+        }
+        catch {
+            Log-Error "root\wmi" "BatteryFullChargedCapacity" $_
+            Write-Host "ACPI battery data unavailable." -ForegroundColor Yellow
+        }
+    }
+
+    Read-Host "Press ENTER"
+}
+
+function DiagnosticInfo {
+    Show-Header
+    Write-Host "[ Diagnostic Information ]"
+    Write-Host ""
+
+    Write-Host "Checking system WMI configuration..." -ForegroundColor Cyan
+    Write-Host ""
+
+    # Check BatteryStaticData via Get-WmiObject (CimInstance fails on this class)
+    Write-Host "BatteryStaticData (ACPI)               : " -NoNewline
+    if (Test-WmiClass -Namespace "root\wmi" -ClassName "BatteryStaticData") {
+        Write-Host "Available" -ForegroundColor Green
+    }
+    else {
+        Write-Host "Not available" -ForegroundColor Red
+    }
+
+    # Show design capacity resolution diagnostic
+    Write-Host ""
+    Write-Host "[ Design Capacity Resolution ]" -ForegroundColor Cyan
+
+    # Test Source 1: Get-WmiObject BatteryStaticData
+    Write-Host "  Source 1 - BatteryStaticData (WmiObject) : " -NoNewline
+    try {
+        $sd = @(Get-WmiObject -Namespace root\wmi -Class BatteryStaticData -ErrorAction SilentlyContinue)
+        if ($sd -and $sd.Count -gt 0 -and $sd[0].DesignedCapacity -gt 0) {
+            Write-Host "$($sd[0].DesignedCapacity) mWh" -ForegroundColor Green
+        } else {
+            Write-Host "Returned 0 or empty" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "Failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    # Test Source 2: powercfg XML
+    Write-Host "  Source 2 - powercfg /batteryreport /XML : " -NoNewline
+    try {
+        $xmlPath = Join-Path $env:TEMP "battery_diag_$PID.xml"
+        $null = & powercfg /batteryreport /XML /OUTPUT $xmlPath 2>$null
+        if (Test-Path $xmlPath) {
+            [xml]$report = Get-Content $xmlPath -ErrorAction SilentlyContinue
+            Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+            $batNode = @($report.BatteryReport.Batteries.Battery)
+            if ($batNode -and $batNode[0].DesignCapacity -gt 0) {
+                Write-Host "$($batNode[0].DesignCapacity) mWh" -ForegroundColor Green
+            } else {
+                Write-Host "Returned 0 or empty" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "Report file not created" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "Failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    # Show final resolved value
+    Write-Host "  Resolved Design Capacity              : " -NoNewline
+    $dcVal = Get-DesignCapacity -Index 0
+    if ($dcVal) {
+        Write-Host "$dcVal mWh" -ForegroundColor Green
+    } else {
+        Write-Host "Not found from any source" -ForegroundColor Red
+    }
+    Write-Host ""
+
+    # Check Lenovo System Interface Foundation (SIF)
+    # SIF is the driver package that registers root\Lenovo. Options 2 and 5
+    # depend on it. We check SIF installation and namespace availability
+    # independently so a partial install (SIF present but namespace broken)
+    # is reported accurately rather than lumped with "not installed".
+    Write-Host "[ Lenovo System Interface Foundation ]" -ForegroundColor Cyan
+    Write-Host ""
+
+    Write-Host "  SIF Installed                         : " -NoNewline
+    $sifInstalled = Test-SifInstalled
+    $deviceFamily = Get-LenovoDeviceFamily
+    if ($sifInstalled) {
+        Write-Host "Yes" -ForegroundColor Green
+    }
+    else {
+        Write-Host "No" -ForegroundColor Red
+        Write-Host ""
+        if ($deviceFamily -eq "Other") {
+            Write-Host "  Note: SIF is a ThinkPad-exclusive driver package." -ForegroundColor Yellow
+            Write-Host "  root\Lenovo is not available on this device by design." -ForegroundColor Yellow
+        } else {
+            Write-Host "  SIF is required for Options 2 (Lenovo Battery Cycles)" -ForegroundColor Yellow
+            Write-Host "  and 5 (Comprehensive Battery Analysis)." -ForegroundColor Yellow
+            Write-Host "  Install SIF from support.lenovo.com -> Drivers & Software." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "  root\Lenovo Namespace                 : " -NoNewline
+    if (Test-LenovoNamespace) {
+        Write-Host "Available" -ForegroundColor Green
+        
+        Write-Host ""
+        Write-Host "  Lenovo Classes:"
+        
+        Write-Host "    - Lenovo_Odometer                 : " -NoNewline
+        if (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Odometer") {
+            Write-Host "Available" -ForegroundColor Green
+        }
+        else {
+            Write-Host "Not available" -ForegroundColor Red
+        }
+        
+        Write-Host "    - Lenovo_WarrantyInformation      : " -NoNewline
+        if (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_WarrantyInformation") {
+            Write-Host "Available" -ForegroundColor Green
+        }
+        else {
+            Write-Host "Not available" -ForegroundColor Red
+        }
+    }
+    else {
+        Write-Host "Not available" -ForegroundColor Red
+        Write-Host ""
+        if ($deviceFamily -eq "Other") {
+            Write-Host "  root\Lenovo is a ThinkPad-exclusive firmware feature." -ForegroundColor Yellow
+            Write-Host "  It is not present on this device by design." -ForegroundColor Yellow
+        } elseif ($sifInstalled) {
+            Write-Host "  SIF appears installed but root\Lenovo was not found." -ForegroundColor Yellow
+            Write-Host "  To resolve:" -ForegroundColor Yellow
+            Write-Host "    1. Restart WMI service:  Restart-Service winmgmt"
+            Write-Host "    2. Reinstall SIF from support.lenovo.com"
+        }
+        else {
+            Write-Host "  SIF is not installed. This is expected — the namespace" -ForegroundColor Yellow
+            Write-Host "  is created by SIF during driver installation." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host ""
+
+    # ── CDRT Odometer (Commercial Vantage) ──────────────────────────────
+    # The CDRT Odometer is deployed by Commercial Vantage on top of SIF.
+    # We report installation status and which CDRT fields are resolvable.
+    Write-Host "[ CDRT Odometer (Commercial Vantage) ]" -ForegroundColor Cyan
+    Write-Host ""
+
+    Write-Host "  Commercial Vantage Detected           : " -NoNewline
+    $cvInstalled = Test-CommercialVantage
+    if ($cvInstalled) {
+        Write-Host "Yes" -ForegroundColor Green
+    }
+    else {
+        Write-Host "No" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Commercial Vantage is required for Option 11 (CDRT Odometer)." -ForegroundColor Yellow
+        Write-Host "  It deploys the CDRT MOF that adds CPU uptime, shock, and thermal" -ForegroundColor Yellow
+        Write-Host "  event tracking to Lenovo_Odometer." -ForegroundColor Yellow
+    }
+
+    Write-Host "  CDRT Fields Available                 : " -NoNewline
+    if ($cvInstalled -and (Test-LenovoNamespace)) {
+        $cdrtData = Get-CdrtOdometerData
+        if ($cdrtData.Available) {
+            Write-Host "Yes" -ForegroundColor Green
+            Write-Host "    - CPU Uptime    : " -NoNewline
+            Write-Host $(if ($null -ne $cdrtData.CpuUptimeMinutes) { "~$([math]::Round($cdrtData.CpuUptimeMinutes / 60, 1)) hours ($($cdrtData.CpuUptimeMinutes) min raw)" } else { "Not found" }) -ForegroundColor $(if ($null -ne $cdrtData.CpuUptimeMinutes) { "Green" } else { "Yellow" })
+            Write-Host "    - Shock Events  : " -NoNewline
+            Write-Host $(if ($null -ne $cdrtData.ShockEvents) { $cdrtData.ShockEvents } else { "Not found" }) -ForegroundColor $(if ($null -ne $cdrtData.ShockEvents) { "Green" } else { "Yellow" })
+            Write-Host "    - Thermal Events: " -NoNewline
+            Write-Host $(if ($null -ne $cdrtData.ThermalEvents) { $cdrtData.ThermalEvents } else { "Not found" }) -ForegroundColor $(if ($null -ne $cdrtData.ThermalEvents) { "Green" } else { "Yellow" })
+        }
+        else {
+            Write-Host "No" -ForegroundColor Yellow
+            Write-Host "    $($cdrtData.UnavailableReason)" -ForegroundColor DarkGray
+        }
+    }
+    else {
+        Write-Host "No" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Read-Host "Press ENTER"
+}
+
+function ComprehensiveBatteryAnalysis {
+    Show-Header
+    Write-Host "[ Comprehensive Battery Analysis ]"
+    Write-Host ""
+
+    $hasLenovoData = $false
+    $hasACPIData = $false
+    $cycles = 0
+
+    # Try to get Lenovo cycle data
+    # Requires Lenovo System Interface Foundation (SIF) to be installed.
+    # SIF registers the root\Lenovo namespace; without it this block is skipped
+    # and the analysis proceeds with ACPI-only capacity data.
+    if (Test-LenovoNamespace) {
+        try {
+            $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
+            $cycles = ([string]$odo.Battery_cycles -replace '\D','')
+            $hasLenovoData = $true
+            
+            Write-Host "[ Lenovo EC Data ]"
+            Write-Host "Cycle Count : $cycles"
+            Write-Host "Shock Events: $($odo.Shock_events)"
+            Write-Host "Thermal     : $($odo.Thermal_events)"
+            Write-Host ""
+        }
+        catch {
+            Log-Error "root\Lenovo" "Lenovo_Odometer" $_
+            Write-Host "Lenovo cycle data unavailable." -ForegroundColor Yellow
+            Write-Host ""
+        }
+    }
+    else {
+        # root\Lenovo namespace missing — show device-aware explanation.
+        # ACPI capacity data will still be shown below if available.
+        Write-Host "[ Lenovo EC Data ]" -ForegroundColor Yellow
+        Get-LenovoNamespaceUnavailableMessage -Feature "battery cycle count and EC data"
+        Write-Host ""
+    }
+
+    # Try to get ACPI battery capacity data
+    if (Test-WmiClass -Namespace "root\wmi" -ClassName "BatteryFullChargedCapacity") {
+        try {
+            $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+
+            if ($batteries -and $batteries.Count -gt 0) {
+                $hasACPIData = $true
+                Write-Host "[ ACPI Battery Capacity Data ]"
+                Write-Host ""
+
+                $index = 0
+                foreach ($bat in $batteries) {
+                    try {
+                        $FullCharge = Get-SafeWmiProperty -Object $bat -PropertyName "FullChargedCapacity"
+                        
+                        # Get design capacity and manufacturer via multi-source helpers
+                        $DesignCapValue = Get-DesignCapacity -Index $index
+                        $Manufacturer   = Get-BatteryManufacturer -Index $index
+                        
+                        $DesignCap = if ($DesignCapValue) { $DesignCapValue } else { "Unavailable" }
+                        
+                        Write-Host "Battery #: $index"
+                        Write-Host ("-" * 50)
+                        Write-Host "Instance Name        : $($bat.InstanceName)"
+                        Write-Host "Manufacturer         : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })"
+                        Write-Host "Full Charge Capacity : $FullCharge"
+                        Write-Host "Design Capacity      : $DesignCap"
+                        
+                        # Get comprehensive classification with cycle data
+                        $classification = Get-BatteryClassification -DesignCapacity $DesignCapValue -FullChargeCapacity $FullCharge -CycleCount $cycles -Manufacturer $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })
+                        
+                        Write-Host ""
+                        Write-Host "[ Battery Health Classification ]"
+                        
+                        $severityColor = switch ($classification.Severity) {
+                             0 { "Green" }
+                            1 { "Cyan" }
+                            2 { "Yellow" }
+                            3 { "Magenta" }
+                            4 { "Red" }
+                            default { "White" }
+                        }
+                        
+                        Write-Host "Health Percentage    : " -NoNewline
+                        Write-Host "$($classification.HealthPercent)%" -ForegroundColor $severityColor
+                        
+                        Write-Host "Classification       : " -NoNewline
+                        Write-Host $classification.Classification -ForegroundColor $severityColor
+                        Write-Host "Status               : " -NoNewline
+                        Write-Host $classification.Message -ForegroundColor $severityColor
+                        
+                        if (-not $classification.IsGenuine) {
+                            Write-Host "WARNING: Non-genuine battery detected" -ForegroundColor Red
+                        }
+                        
+                        if ($classification.FailureFlag) {
+                            Write-Host "ALERT: Battery replacement needed immediately!" -ForegroundColor Red
+                        }
+                        
+                        Write-Host ""
+                        $index++
+                    }
+                    catch {
+                        Log-BatteryError "root\wmi" "BatteryFullChargedCapacity" $_ $index $($bat.InstanceName) $null
+                        Write-Host "Battery #: $index - Analysis failed" -ForegroundColor Red
+                        Write-Host ""
+                        $index++
+                    }
+                }
+            }
+            else {
+                Write-Host "No ACPI battery capacity data available." -ForegroundColor Yellow
+                Write-Host ""
+            }
+        }
+        catch {
+            Log-Error "root\wmi" "BatteryFullChargedCapacity" $_
+            Write-Host "ACPI battery data unavailable." -ForegroundColor Yellow
+            Write-Host ""
+        }
+    }
+
+    # Try Win32_Battery as fallback
+    if (-not $hasACPIData) {
+        try {
+            $batteries = @(Get-CimInstance -CimSession $script:CimSession -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+
+            if ($batteries -and $batteries.Count -gt 0) {
+                Write-Host "[ Windows Battery (Fallback) ]"
+                Write-Host ""
+
+                foreach ($bat in $batteries) {
+                    try {
+                        $percent = Get-SafeWmiProperty -Object $bat -PropertyName "EstimatedChargeRemaining"
+                        $deviceID = Get-SafeWmiProperty -Object $bat -PropertyName "DeviceID"
+                        $manufacturer = Get-SafeWmiProperty -Object $bat -PropertyName "Manufacturer"
+                        $status = Get-SafeWmiProperty -Object $bat -PropertyName "Status"
+
+                        Write-Host "Battery #: $deviceID"
+                        Write-Host "Estimated Charge : $percent %"
+                        
+                        $classification = Get-BatteryClassification -DesignCapacity $null -FullChargeCapacity $percent -CycleCount $cycles -BatteryStatus $status -Manufacturer $manufacturer
+                        
+                        $severityColor = switch ($classification.Severity) {
+                             0 { "Green" }
+                            1 { "Cyan" }
+                            2 { "Yellow" }
+                            3 { "Magenta" }
+                            4 { "Red" }
+                            default { "White" }
+                        }
+                        
+                        Write-Host "Classification     : " -NoNewline
+                        Write-Host $classification.Classification -ForegroundColor $severityColor
+                        Write-Host "Battery Status      : $status"
+                        
+                        if (-not $classification.IsGenuine) {
+                            Write-Host "WARNING: Non-genuine battery detected" -ForegroundColor Red
+                        }
+                        
+                        Write-Host ""
+                    }
+                    catch {
+                        Log-BatteryError "root\cimv2" "Win32_Battery" $_ $null $($bat.DeviceID) $null
+                        Write-Host "Battery analysis failed." -ForegroundColor Red
+                        Write-Host ""
+                    }
+                }
+            }
+        }
+        catch {
+            Log-Error "root\cimv2" "Win32_Battery" $_
+            Write-Host "No battery data available from any source." -ForegroundColor Red
+        }
+    }
+    
+    if (-not $hasLenovoData -and -not $hasACPIData) {
+        Write-Host "Unable to retrieve comprehensive battery data." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "This requires:" -ForegroundColor Yellow
+        Write-Host "  • Lenovo WMI provider (for cycle data)" -ForegroundColor Yellow
+        Write-Host "  • ACPI battery support (for capacity data)" -ForegroundColor Yellow
+    }
+
+    Read-Host "Press ENTER"
+}
+
+function ExportReport {
+
+    $reportPath = "$env:USERPROFILE\ThinkPad_Report.txt"
+    $errorPath  = "$env:USERPROFILE\ThinkPad_ErrorLog.txt"
+
+    [System.Collections.Generic.List[string]]$Report = @()
+
+    $si = Get-SystemInfo
+    $Report += "==============================================="
+    $Report += " THINKPAD UTILITY MANAGEMENT DIAGNOSTIC REPORT"
+    $Report += " Generated : $(Get-Date)"
+    $Report += " Device    : $env:COMPUTERNAME"
+    $Report += " Model     : $($si.Model)"
+    $Report += " BIOS      : $($si.BIOSVersion)  ($($si.BIOSDate))"
+    $Report += "==============================================="
+    $Report += ""
+
+    # ---------------- Windows Battery ----------------
+    try {
+        if (Test-WmiClass -ClassName "Win32_Battery") {
+            $batteries = @(Get-CimInstance -CimSession $script:CimSession -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+
+            $Report += "[ Windows Battery - Win32_Battery ]"
+            if (-not $batteries -or $batteries.Count -eq 0) {
+                $Report += "No batteries found."
+            }
+            else {
+                foreach ($bat in $batteries) {
+                    $Report += "Battery ID       : $(Get-SafeWmiProperty -Object $bat -PropertyName 'DeviceID')"
+                    $Report += "Manufacturer     : $(Get-SafeWmiProperty -Object $bat -PropertyName 'Manufacturer')"
+                    $Report += "Serial           : $(Get-SafeWmiProperty -Object $bat -PropertyName 'SerialNumber')"
+                    $Report += "Charge           : $(Get-SafeWmiProperty -Object $bat -PropertyName 'EstimatedChargeRemaining') %"
+                    $Report += ""
+                }
+            }
+            $Report += ""
+        }
+        else {
+            $Report += "[ Windows Battery - Win32_Battery ]"
+            $Report += "Win32_Battery class not available."
+            $Report += ""
+        }
+    }
+    catch {
+        Log-Error "root\cimv2" "Win32_Battery" $_
+        $Report += "[ Windows Battery - Win32_Battery ]"
+        $Report += "Win32_Battery FAILED"
+        $Report += ""
+    }
+
+    # ---------------- Lenovo Cycles ----------------
+    if (Test-LenovoNamespace) {
+        try {
+            $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
+            $cycles = ([string]$odo.Battery_cycles -replace '\D','')
+
+            $Report += "[ Lenovo EC - Lenovo_Odometer ]"
+            $Report += "Cycle Count : $cycles"
+            $Report += "Shock Events: $($odo.Shock_events)"
+            $Report += "Thermal     : $($odo.Thermal_events)"
+            $Report += ""
+        }
+        catch {
+            Log-Error "root\Lenovo" "Lenovo_Odometer" $_
+            $Report += "Lenovo_Odometer FAILED"
+            $Report += ""
+        }
+    }
+    else {
+        $Report += "[ Lenovo EC - Lenovo_Odometer ]"
+        $Report += "Lenovo WMI provider not available on this system."
+        $Report += ""
+    }
+
+    # ---------------- Warranty ----------------
+    if (Test-LenovoNamespace) {
+        try {
+            $w = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_WarrantyInformation -ErrorAction Stop
+
+            $Report += "[ Warranty - Lenovo_WarrantyInformation ]"
+            $Report += "Serial : $($w.SerialNumber)"
+            $Report += "Start  : $($w.StartDate)"
+            $Report += "End    : $($w.EndDate)"
+            $Report += "Last Sync : $($w.LastUpdateTime)"
+            $Report += ""
+        }
+        catch {
+            Log-Error "root\Lenovo" "Lenovo_WarrantyInformation" $_
+            $Report += "Warranty FAILED"
+            $Report += ""
+        }
+    }
+    else {
+        $Report += "[ Warranty - Lenovo_WarrantyInformation ]"
+        $Report += "Lenovo WMI provider not available on this system."
+        $Report += ""
+    }
+
+    # ---------------- Full Charge Capacity ----------------
+    try {
+        # Get BatteryFullChargedCapacity
+        $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+
+        $Report += "[ Battery Capacity Health ]"
+
+        if (-not $batteries -or $batteries.Count -eq 0) {
+            $Report += "No battery capacity data found."
+        }
+        else {
+            for ($i = 0; $i -lt $batteries.Count; $i++) {
+                try {
+                    if ($batteries[$i] -and $batteries[$i].FullChargedCapacity) {
+                        $FullCharge = $batteries[$i].FullChargedCapacity
+                        
+                        # Get design capacity via multi-source helper (uses Get-WmiObject + powercfg fallback)
+                        $DesignCapValue = Get-DesignCapacity -Index $i
+                        
+                        $DesignCap = if ($DesignCapValue) { $DesignCapValue } else { "Unavailable" }
+                        $Health     = "Unavailable"
+
+                        # Only calculate health if both values are numeric
+                        [int64]$fc = 0
+                        [int64]$dc = 0
+
+                        if ($null -ne $DesignCapValue -and
+                            [int64]::TryParse($FullCharge.ToString(), [ref]$fc) -and
+                            [int64]::TryParse($DesignCapValue.ToString(), [ref]$dc) -and
+                            $dc -gt 0)
+                        {
+                            $Health = [math]::Round(($fc / $dc) * 100, 2)
+                        }
+                        else {
+                            $Health = "Unavailable"
+                        }
+                        $Report += "Battery #: $i"
+                        $Report += "Instance Name        : $($batteries[$i].InstanceName)"
+                        $Report += "Full Charge Capacity : $FullCharge"
+                        $Report += "Design Capacity      : $DesignCap"
+                        $Report += "Health %             : $Health"
+                        $Report += ""
+                    }
+                    else {
+                        $Report += "Battery #: $i - Data unavailable"
+                        $Report += ""
+                    }
+                }
+                catch {
+                    Log-BatteryError "root\wmi" "BatteryFullChargedCapacity" $_ $i $($batteries[$i].InstanceName) $null
+                    $Report += "Battery #: $i - FAILED"
+                    $Report += ""
+                }
+            }
+        }
+    }
+    catch {
+        Log-Error "root\wmi" "BatteryFullChargedCapacity" $_
+
+        $Report += "ACPI battery data unavailable and Win32_Battery fallback has been removed (ACPI-only mode)."
+    }
+
+    # -------- Comprehensive Battery Analysis --------
+    try {
+        $Report += "[ Comprehensive Battery Analysis ]"
+        $Report += ""
+        
+        $reportCycles = 0
+        if (Test-LenovoNamespace) {
+            try {
+                $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction SilentlyContinue
+                $reportCycles = ([string]$odo.Battery_cycles -replace '\D','')
+                $Report += "Cycle Count  : $reportCycles"
+                $Report += ""
+            }
+            catch {
+                $Report += "Lenovo cycle data unavailable."
+                $Report += ""
+            }
+        }
+        
+        try {
+            $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+            
+            if ($batteries -and $batteries.Count -gt 0) {
+                $Report += "[ Battery Health Analysis ]"
+                
+                $index = 0
+                foreach ($bat in $batteries) {
+                    try {
+                        $FullCharge = Get-SafeWmiProperty -Object $bat -PropertyName "FullChargedCapacity"
+                        
+                        # Get design capacity and manufacturer via multi-source helpers
+                        $DesignCapValue  = Get-DesignCapacity -Index $index
+                        $Manufacturer    = Get-BatteryManufacturer -Index $index
+                        
+                        $classification = Get-BatteryClassification -DesignCapacity $DesignCapValue -FullChargeCapacity $FullCharge -CycleCount $reportCycles -Manufacturer $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })
+                        
+                        $Report += ""
+                        $Report += "Battery #: $index"
+                        $Report += "  Manufacturer         : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })"
+                        $Report += "  Health Percentage    : $($classification.HealthPercent)%"
+                        $Report += "  Classification       : $($classification.Classification)"
+                        $Report += "  Severity             : $($classification.Severity)/3"
+                        $Report += "  Genuine              : $(if ($classification.IsGenuine) { "Yes" } else { "No - Non-genuine battery" })"
+                        $Report += "  Status               : $($classification.Message)"
+                        $Report += ""
+                        
+                        $index++
+                    }
+                    catch {
+                        $Report += "Battery #: $index - Analysis failed"
+                        $Report += ""
+                    }
+                }
+            }
+            else {
+                $Report += "No ACPI battery data available for analysis."
+                $Report += ""
+            }
+        }
+        catch {
+            $Report += "Comprehensive analysis unavailable."
+            $Report += ""
+        }
+    }
+    catch {
+        $Report += "[ Comprehensive Battery Analysis ]"
+        $Report += "Unable to generate."
+        $Report += ""
+    }
+
+    # Save report
+    $Report | Out-File $reportPath -Encoding UTF8
+
+    # Save errors if exist - with detailed exception info
+    if ($script:ErrorLog.Count -gt 0) {
+        $ErrorOutput = @()
+        foreach ($err in $script:ErrorLog) {
+            $ErrorOutput += ("=" * 70)
+            $ErrorOutput += "TimeStamp       : $($err.TimeStamp)"
+            $ErrorOutput += "Namespace       : $($err.Namespace)"
+            $ErrorOutput += "Class           : $($err.Class)"
+            $ErrorOutput += "Message         : $($err.Message)"
+            $ErrorOutput += "ScriptName      : $($err.ScriptName)"
+            $ErrorOutput += "ScriptLineNumber: $($err.ScriptLineNumber)"
+            if ($err.Context) {
+                $ErrorOutput += "Context         : $($err.Context)"
+            }
+            if ($err.BatteryDetails) {
+                $ErrorOutput += "Battery Details :"
+                $ErrorOutput += "  - InstanceName       : $($err.BatteryDetails.InstanceName)"
+                $ErrorOutput += "  - FullChargedCapacity: $($err.BatteryDetails.FullChargedCapacity)"
+                $ErrorOutput += "  - DesignedCapacity   : $($err.BatteryDetails.DesignedCapacity)"
+            }
+            $ErrorOutput += "StackTrace      : $($err.StackTrace)"
+            $ErrorOutput += ""
+        }
+        $ErrorOutput | Out-File $errorPath -Encoding UTF8
+    }
+
+    Show-Header
+    Write-Host "Report saved to:" -ForegroundColor Green
+    Write-Host $reportPath
+
+    if ($script:ErrorLog.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Errors saved to:" -ForegroundColor Yellow
+        Write-Host $errorPath
+    }
+
+    Read-Host "Press ENTER"
+}
+
+function Get-BatteryAgeEstimate {
+    <#
+    .SYNOPSIS
+    Estimates battery age in years using two independent methods and cross-validates them.
+
+    Method 1 - Cycle-based:
+      Average laptop user does ~200-300 cycles/year (partial cycles, plugged in sometimes).
+      Conservative baseline: 250 cycles/year.
+      Source: ASUS, Lenovo, and independent battery longevity studies.
+
+    Method 2 - Capacity-based:
+      Li-ion batteries lose ~20% capacity after ~300 cycles (approx 1 year typical use).
+      Capacity loss is non-linear: faster early, stabilizes mid-life, accelerates near EOL.
+      We use a simplified linear model: 100% health = 0 years, 0% health = ~5 years.
+      This is conservative and matches real-world laptop battery observations.
+
+    If both estimates agree within 1 year, confidence is High.
+    If they diverge by 1-2 years, confidence is Medium with a likely explanation.
+    If they diverge by more than 2 years, confidence is Low with usage pattern notes.
+    #>
+    param(
+        [object]$CycleCount,
+        [object]$HealthPercent
+    )
+
+    $result = [PSCustomObject]@{
+        CycleBasedYears    = $null
+        CapacityBasedYears = $null
+        EstimatedYears     = $null
+        Confidence         = "Unknown"
+        Note               = ""
+        HasCycleData       = $false
+        HasCapacityData    = $false
+    }
+
+    # --- Method 1: Cycle-based estimate ---
+    [int64]$cycles = 0
+    if ($CycleCount -and [int64]::TryParse(($CycleCount -replace '\D',''), [ref]$cycles) -and $cycles -gt 0) {
+        # 250 cycles/year is the conservative average for a typical laptop user
+        $result.CycleBasedYears = [math]::Round($cycles / 250, 1)
+        $result.HasCycleData = $true
+    }
+
+    # --- Method 2: Capacity-based estimate ---
+    [double]$health = 0
+    if ($HealthPercent -and [double]::TryParse([string]$HealthPercent, [ref]$health) -and $health -gt 0) {
+        # Capacity loss model: battery rated for ~5 years at 0% health (fully degraded)
+        # 100% health = new (0 years), linear degradation to end of useful life
+        $capacityLoss = 100 - $health
+        # Each ~4% loss per year is the baseline (20% loss over ~5 years)
+        $result.CapacityBasedYears = [math]::Round($capacityLoss / 4.0, 1)
+        if ($result.CapacityBasedYears -lt 0) { $result.CapacityBasedYears = 0 }
+        $result.HasCapacityData = $true
+    }
+
+    # --- Cross-validate and determine confidence ---
+    if ($result.HasCycleData -and $result.HasCapacityData) {
+        $diff = [math]::Abs($result.CycleBasedYears - $result.CapacityBasedYears)
+        # Use weighted average (capacity slightly more reliable for calendar aging)
+        $result.EstimatedYears = [math]::Round(($result.CycleBasedYears * 0.45 + $result.CapacityBasedYears * 0.55), 1)
+
+        if ($diff -le 1.0) {
+            $result.Confidence = "High"
+            $result.Note = "Both methods agree. Estimate is reliable."
+        }
+        elseif ($diff -le 2.0) {
+            $result.Confidence = "Medium"
+            if ($result.CycleBasedYears -lt $result.CapacityBasedYears) {
+                $result.Note = "Capacity has degraded more than cycles suggest. Battery may have experienced high temperatures or prolonged storage at full charge."
+            } else {
+                $result.Note = "More cycles than capacity loss suggests. Battery may have been lightly used per cycle (partial discharges) or kept in cool conditions."
+            }
+        }
+        else {
+            $result.Confidence = "Low"
+            if ($result.CycleBasedYears -lt $result.CapacityBasedYears) {
+                $result.Note = "Significant divergence: capacity loss greatly exceeds cycle count. Likely calendar aging from long-term storage or heat exposure."
+            } else {
+                $result.Note = "Significant divergence: high cycle count but capacity well preserved. Possible shallow cycling habits or battery replacement."
+            }
+        }
+    }
+    elseif ($result.HasCycleData) {
+        $result.EstimatedYears = $result.CycleBasedYears
+        $result.Confidence = "Medium"
+        $result.Note = "Cycle-based estimate only. No capacity data available for cross-validation."
+    }
+    elseif ($result.HasCapacityData) {
+        $result.EstimatedYears = $result.CapacityBasedYears
+        $result.Confidence = "Medium"
+        $result.Note = "Capacity-based estimate only. No cycle data available for cross-validation."
+    }
+    else {
+        $result.Confidence = "Unknown"
+        $result.Note = "Insufficient data. Neither cycle count nor health percentage is available."
+    }
+
+    return $result
+}
+
+function BatteryAgeEstimation {
+    Show-Header
+    Write-Host "[ Battery Age Estimation ]"
+    Write-Host ""
+
+    $cycles = $null
+    $health = $null
+
+    # --- Get cycle count from Lenovo EC ---
+    if (Test-LenovoNamespace) {
+        try {
+            $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
+            $cycles = ([string]$odo.Battery_cycles -replace '\D','')
+            Write-Host "Cycle Count (Lenovo EC)  : $cycles"
+        }
+        catch {
+            Log-Error "root\Lenovo" "Lenovo_Odometer" $_
+            Write-Host "Cycle Count              : Unavailable (Lenovo EC not accessible)" -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "Cycle Count              : Unavailable (Lenovo namespace not found)" -ForegroundColor Yellow
+    }
+
+    # --- Get capacity and calculate health ---
+    try {
+        $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+        if ($batteries -and $batteries.Count -gt 0) {
+            $fcRaw = Get-SafeWmiProperty -Object $batteries[0] -PropertyName "FullChargedCapacity"
+            $dcRaw = Get-DesignCapacity -Index 0
+
+            [int64]$fc = 0
+            [int64]$dc = 0
+            if ($null -ne $fcRaw -and $null -ne $dcRaw -and
+                [int64]::TryParse($fcRaw.ToString(), [ref]$fc) -and
+                [int64]::TryParse($dcRaw.ToString(), [ref]$dc) -and
+                $dc -gt 0) {
+                $health = [math]::Round(($fc / $dc) * 100, 2)
+                Write-Host "Full Charge Capacity     : $fc mWh"
+                Write-Host "Design Capacity          : $dc mWh"
+                Write-Host "Health Percentage        : $health%"
+            }
+            else {
+                Write-Host "Health Percentage        : Unavailable" -ForegroundColor Yellow
+            }
+        }
+        else {
+            Write-Host "Health Percentage        : Unavailable (no ACPI battery data)" -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Log-Error "root\wmi" "BatteryFullChargedCapacity" $_
+        Write-Host "Health Percentage        : Unavailable" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+
+    # --- Run estimation ---
+    $estimate = Get-BatteryAgeEstimate -CycleCount $cycles -HealthPercent $health
+
+    if ($estimate.Confidence -eq "Unknown") {
+        Write-Host "[ Age Estimation ]" -ForegroundColor Yellow
+        Write-Host "Insufficient data to estimate battery age." -ForegroundColor Yellow
+        Write-Host $estimate.Note -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "[ Age Estimation ]"
+        Write-Host ("-" * 50)
+
+        if ($estimate.HasCycleData) {
+            Write-Host "Cycle-based estimate     : ~$($estimate.CycleBasedYears) year(s)"
+        }
+        if ($estimate.HasCapacityData) {
+            Write-Host "Capacity-based estimate  : ~$($estimate.CapacityBasedYears) year(s)"
+        }
+
+        Write-Host ""
+
+        $confidenceColor = switch ($estimate.Confidence) {
+            "High"   { "Green" }
+            "Medium" { "Yellow" }
+            "Low"    { "Magenta" }
+            default  { "White" }
+        }
+
+        Write-Host "Estimated Age            : " -NoNewline
+        Write-Host "~$($estimate.EstimatedYears) year(s)" -ForegroundColor $confidenceColor
+        Write-Host "Confidence               : " -NoNewline
+        Write-Host $estimate.Confidence -ForegroundColor $confidenceColor
+        Write-Host ""
+        Write-Host "Note: $($estimate.Note)" -ForegroundColor $confidenceColor
+        Write-Host ""
+        Write-Host "Disclaimer: This is a statistical estimate based on typical Li-ion" -ForegroundColor DarkGray
+        Write-Host "degradation patterns. Actual age may vary with usage habits, temperature," -ForegroundColor DarkGray
+        Write-Host "and whether the battery has been replaced." -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+    Read-Host "Press ENTER"
+}
+
+function Get-ChargeThreshold {
+    <#
+    .SYNOPSIS
+    Reads battery charge threshold settings from Lenovo_BiosSetting (root\wmi).
+    Returns a PSCustomObject with StartThreshold, StopThreshold, and raw setting names.
+    Returns $null if the class is unavailable or no threshold settings are found.
+
+    The CurrentSetting property format is: "SettingName,CurrentValue"
+    Setting names vary by ThinkPad model and firmware generation.
+    Known names: CustomChargeThreshold, BatteryChargeThresholdStart, BatteryChargeThresholdStop.
+    We scan for any setting containing "threshold" or "charge" to maximize compatibility.
+    #>
+
+    $result = [PSCustomObject]@{
+        StartThreshold     = $null
+        StopThreshold      = $null
+        StartSettingName   = $null
+        StopSettingName    = $null
+        RawStart           = $null
+        RawStop            = $null
+        Supported          = $false
+        UnsupportedReason  = ""
+    }
+
+    if (-not (Test-LenovoNamespace)) {
+        $result.UnsupportedReason = "Lenovo WMI namespace not available."
+        return $result
+    }
+
+    try {
+        $settings = @(Get-WmiObject -Namespace root\wmi -Class Lenovo_BiosSetting -ErrorAction Stop)
+
+        if (-not $settings -or $settings.Count -eq 0) {
+            $result.UnsupportedReason = "Lenovo_BiosSetting returned no settings."
+            return $result
+        }
+
+        # Scan for start threshold — known setting names and patterns
+        $startNames = @("BatteryChargeThresholdStart", "CustomThresholdStart", "ChargeStartThreshold")
+        $startSetting = $null
+        foreach ($name in $startNames) {
+            $startSetting = $settings | Where-Object { $_.CurrentSetting -like "$name,*" } | Select-Object -First 1
+            if ($startSetting) { break }
+        }
+        # Broad fallback scan
+        if (-not $startSetting) {
+            $startSetting = $settings | Where-Object {
+                $_.CurrentSetting -match '(?i)(start|begin).*(threshold|charge)' -or
+                $_.CurrentSetting -match '(?i)(threshold|charge).*(start|begin)'
+            } | Select-Object -First 1
+        }
+
+        # Scan for stop threshold — known setting names and patterns
+        $stopNames = @("BatteryChargeThresholdStop", "CustomThresholdStop", "ChargeStopThreshold")
+        $stopSetting = $null
+        foreach ($name in $stopNames) {
+            $stopSetting = $settings | Where-Object { $_.CurrentSetting -like "$name,*" } | Select-Object -First 1
+            if ($stopSetting) { break }
+        }
+        # Broad fallback scan
+        if (-not $stopSetting) {
+            $stopSetting = $settings | Where-Object {
+                $_.CurrentSetting -match '(?i)(stop|end).*(threshold|charge)' -or
+                $_.CurrentSetting -match '(?i)(threshold|charge).*(stop|end)'
+            } | Select-Object -First 1
+        }
+
+        if (-not $startSetting -and -not $stopSetting) {
+            $result.UnsupportedReason = "No charge threshold settings found in Lenovo_BiosSetting. This ThinkPad model may not support threshold control via WMI, or the setting names differ from known patterns."
+            return $result
+        }
+
+        $result.Supported = $true
+
+        if ($startSetting) {
+            $parts = $startSetting.CurrentSetting -split ',', 2
+            $result.StartSettingName = $parts[0].Trim()
+            $result.RawStart         = $startSetting.CurrentSetting
+            [int]$sv = 0
+            if ($parts.Count -ge 2 -and [int]::TryParse($parts[1].Trim(), [ref]$sv)) {
+                $result.StartThreshold = $sv
+            }
+        }
+
+        if ($stopSetting) {
+            $parts = $stopSetting.CurrentSetting -split ',', 2
+            $result.StopSettingName = $parts[0].Trim()
+            $result.RawStop         = $stopSetting.CurrentSetting
+            [int]$sv = 0
+            if ($parts.Count -ge 2 -and [int]::TryParse($parts[1].Trim(), [ref]$sv)) {
+                $result.StopThreshold = $sv
+            }
+        }
+
+        return $result
+    }
+    catch {
+        Log-Error "root\wmi" "Lenovo_BiosSetting" $_
+        $result.UnsupportedReason = "Failed to query Lenovo_BiosSetting: $($_.Exception.Message)"
+        return $result
+    }
+}
+
+function Set-ChargeThreshold {
+    <#
+    .SYNOPSIS
+    Writes a charge threshold value to Lenovo_SetBiosSetting and commits it via
+    Lenovo_SaveBiosSettings. Returns the return code string from the WMI method.
+
+    The setting string format is: "SettingName,Value" (case-sensitive).
+    Changes take effect on next reboot — the EC reads thresholds at boot time.
+
+    Return codes from Lenovo WMI:
+      "Success"          - Change staged successfully, reboot required
+      "Not Supported"    - This setting is not supported on this model
+      "Invalid Parameter"- Value or setting name is wrong
+      "Access Denied"    - Supervisor password required
+      "BIOS Error"       - Firmware-level failure
+    #>
+    param(
+        [string]$SettingName,
+        [int]$Value,
+        [string]$SupervisorPassword = ""
+    )
+
+    try {
+        $setter = Get-WmiObject -Namespace root\wmi -Class Lenovo_SetBiosSetting -ErrorAction Stop
+
+        # Build the setting string — with or without supervisor password
+        $settingString = if ($SupervisorPassword -ne "") {
+            "$SettingName,$Value,$SupervisorPassword,ascii,us"
+        } else {
+            "$SettingName,$Value"
+        }
+
+        $setResult = $setter.SetBiosSetting($settingString)
+        $returnCode = $setResult.Return
+
+        if ($returnCode -eq "Success") {
+            # Commit the staged change
+            $saver = Get-WmiObject -Namespace root\wmi -Class Lenovo_SaveBiosSettings -ErrorAction Stop
+            if ($SupervisorPassword -ne "") {
+                $saver.SaveBiosSettings("$SupervisorPassword,ascii,us") | Out-Null
+            } else {
+                $saver.SaveBiosSettings() | Out-Null
+            }
+        }
+
+        return $returnCode
+    }
+    catch {
+        Log-Error "root\wmi" "Lenovo_SetBiosSetting" $_
+        return "Exception: $($_.Exception.Message)"
+    }
+}
+
+function ChargeThresholdManager {
+    Show-Header
+    Write-Host "[ Battery Charge Threshold Manager ]"
+    Write-Host ""
+
+    # ── Check Lenovo namespace ───────────────────────────────────────────
+    if (-not (Test-LenovoNamespace)) {
+        Get-LenovoNamespaceUnavailableMessage -Feature "charge threshold control"
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    # ── Read current thresholds ──────────────────────────────────────────
+    Write-Host "Reading current charge thresholds..." -ForegroundColor Cyan
+    $thresholds = Get-ChargeThreshold
+
+    if (-not $thresholds.Supported) {
+        Write-Host ""
+        Write-Host "Charge threshold control is not available on this system." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Reason: $($thresholds.UnsupportedReason)" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "Note: Not all ThinkPad models expose threshold settings via WMI." -ForegroundColor DarkGray
+        Write-Host "      If your model supports thresholds, use Lenovo Vantage instead." -ForegroundColor DarkGray
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    Write-Host ""
+    Write-Host "[ Current Thresholds ]"
+    Write-Host ("-" * 50)
+
+    if ($null -ne $thresholds.StartThreshold) {
+        Write-Host "Start Charging At : " -NoNewline
+        Write-Host "$($thresholds.StartThreshold)%" -ForegroundColor Cyan
+        Write-Host "  Setting name    : $($thresholds.StartSettingName)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "Start Threshold   : Not available" -ForegroundColor Yellow
+    }
+
+    if ($null -ne $thresholds.StopThreshold) {
+        Write-Host "Stop Charging At  : " -NoNewline
+        Write-Host "$($thresholds.StopThreshold)%" -ForegroundColor Cyan
+        Write-Host "  Setting name    : $($thresholds.StopSettingName)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "Stop Threshold    : Not available" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+
+    # ── Warning block ────────────────────────────────────────────────────
+    Write-Host ("=" * 50) -ForegroundColor Yellow
+    Write-Host "  WARNING — READ BEFORE CHANGING THRESHOLDS" -ForegroundColor Yellow
+    Write-Host ("=" * 50) -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  • Changes are written directly to BIOS/EC firmware." -ForegroundColor Yellow
+    Write-Host "  • The new values take effect on the NEXT REBOOT." -ForegroundColor Yellow
+    Write-Host "  • Start threshold MUST be lower than Stop threshold." -ForegroundColor Yellow
+    Write-Host "  • Recommended range: Start 40-75%, Stop 60-80%." -ForegroundColor Yellow
+    Write-Host "  • Setting Stop to 100% disables the upper limit." -ForegroundColor Yellow
+    Write-Host "  • A BIOS Supervisor Password may be required." -ForegroundColor Yellow
+    Write-Host "  • This tool is NOT affiliated with Lenovo." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host ("=" * 50) -ForegroundColor Yellow
+    Write-Host ""
+
+    $proceed = Read-Host "Change thresholds? Type 'Y' to continue or any other key to cancel"
+    if ($proceed.Trim().ToUpper() -ne "Y") {
+        Write-Host "Cancelled." -ForegroundColor DarkGray
+        Read-Host "Press ENTER"
+        return
+    }
+
+    # ── Collect new values ───────────────────────────────────────────────
+    Write-Host ""
+
+    # Start threshold
+    $newStart = $null
+    if ($thresholds.StartSettingName) {
+        do {
+            $input = Read-Host "Enter new Start threshold (1-99, or press ENTER to keep $($thresholds.StartThreshold)%)"
+            if ($input.Trim() -eq "") {
+                $newStart = $null  # keep current
+                break
+            }
+            [int]$parsed = 0
+            if ([int]::TryParse($input.Trim(), [ref]$parsed) -and $parsed -ge 1 -and $parsed -le 99) {
+                $newStart = $parsed
+                break
+            }
+            Write-Host "Invalid value. Enter a number between 1 and 99." -ForegroundColor Red
+        } while ($true)
+    }
+
+    # Stop threshold
+    $newStop = $null
+    if ($thresholds.StopSettingName) {
+        do {
+            $input = Read-Host "Enter new Stop threshold (2-100, or press ENTER to keep $($thresholds.StopThreshold)%)"
+            if ($input.Trim() -eq "") {
+                $newStop = $null  # keep current
+                break
+            }
+            [int]$parsed = 0
+            if ([int]::TryParse($input.Trim(), [ref]$parsed) -and $parsed -ge 2 -and $parsed -le 100) {
+                $newStop = $parsed
+                break
+            }
+            Write-Host "Invalid value. Enter a number between 2 and 100." -ForegroundColor Red
+        } while ($true)
+    }
+
+    # ── Validate start < stop ────────────────────────────────────────────
+    $effectiveStart = if ($null -ne $newStart) { $newStart } else { $thresholds.StartThreshold }
+    $effectiveStop  = if ($null -ne $newStop)  { $newStop  } else { $thresholds.StopThreshold  }
+
+    if ($null -ne $effectiveStart -and $null -ne $effectiveStop -and $effectiveStart -ge $effectiveStop) {
+        Write-Host ""
+        Write-Host "Error: Start threshold ($effectiveStart%) must be lower than Stop threshold ($effectiveStop%)." -ForegroundColor Red
+        Write-Host "No changes were made." -ForegroundColor Red
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    if ($null -eq $newStart -and $null -eq $newStop) {
+        Write-Host ""
+        Write-Host "No changes entered. Nothing was written." -ForegroundColor DarkGray
+        Read-Host "Press ENTER"
+        return
+    }
+
+    # ── Supervisor password ──────────────────────────────────────────────
+    Write-Host ""
+    Write-Host "If a BIOS Supervisor Password is set, enter it below." -ForegroundColor DarkGray
+    Write-Host "Leave blank if no Supervisor Password is configured." -ForegroundColor DarkGray
+    $svpInput = Read-Host "Supervisor Password (leave blank if none)"
+    $svp = $svpInput.Trim()
+
+    # ── Final confirmation ───────────────────────────────────────────────
+    Write-Host ""
+    Write-Host "Summary of changes to be written:" -ForegroundColor Cyan
+    if ($null -ne $newStart) {
+        Write-Host "  Start threshold : $($thresholds.StartThreshold)% -> $newStart%" -ForegroundColor White
+    }
+    if ($null -ne $newStop) {
+        Write-Host "  Stop threshold  : $($thresholds.StopThreshold)% -> $newStop%" -ForegroundColor White
+    }
+    Write-Host ""
+    Write-Host "Changes take effect on next reboot." -ForegroundColor Yellow
+    Write-Host ""
+
+    $confirm = Read-Host "Type 'CONFIRM' to write to firmware, or any other key to cancel"
+    if ($confirm.Trim().ToUpper() -ne "CONFIRM") {
+        Write-Host "Cancelled. No changes were written." -ForegroundColor DarkGray
+        Read-Host "Press ENTER"
+        return
+    }
+
+    # ── Apply changes ────────────────────────────────────────────────────
+    Write-Host ""
+    $allSuccess = $true
+
+    if ($null -ne $newStart -and $thresholds.StartSettingName) {
+        Write-Host "Writing Start threshold..." -NoNewline
+        $rc = Set-ChargeThreshold -SettingName $thresholds.StartSettingName -Value $newStart -SupervisorPassword $svp
+        if ($rc -eq "Success") {
+            Write-Host " OK" -ForegroundColor Green
+        } else {
+            Write-Host " FAILED ($rc)" -ForegroundColor Red
+            $allSuccess = $false
+        }
+    }
+
+    if ($null -ne $newStop -and $thresholds.StopSettingName) {
+        Write-Host "Writing Stop threshold..." -NoNewline
+        $rc = Set-ChargeThreshold -SettingName $thresholds.StopSettingName -Value $newStop -SupervisorPassword $svp
+        if ($rc -eq "Success") {
+            Write-Host " OK" -ForegroundColor Green
+        } else {
+            Write-Host " FAILED ($rc)" -ForegroundColor Red
+            $allSuccess = $false
+        }
+    }
+
+    Write-Host ""
+
+    if ($allSuccess) {
+        Write-Host "Thresholds written successfully." -ForegroundColor Green
+        Write-Host "Reboot your ThinkPad to apply the new charge thresholds." -ForegroundColor Yellow
+    } else {
+        Write-Host "One or more values failed to write." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Common causes:" -ForegroundColor Yellow
+        Write-Host "  • Incorrect or missing Supervisor Password" -ForegroundColor Yellow
+        Write-Host "  • Setting not supported on this firmware version" -ForegroundColor Yellow
+        Write-Host "  • Script not running as Administrator" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Read-Host "Press ENTER"
+}
+
+
+function Show-About {
+    Show-Header
+    Write-Host "[ About ]"
+    Write-Host ""
+
+    # Version & build
+    Write-Host "ThinkPad Utility Management" -ForegroundColor Cyan
+    Write-Host "Version 1.1" -ForegroundColor White
+    Write-Host ""
+
+    # Built with
+    Write-Host "Built with Windows PowerShell, ChatGPT GPT 5.4, and Claude Sonnet 4.6" -ForegroundColor DarkGray
+    Write-Host ""
+
+    # Description
+    Write-Host "A read-only diagnostic tool for ThinkPad systems." -ForegroundColor Gray
+    Write-Host "Reads battery health, cycle data, warranty, and memory" -ForegroundColor Gray
+    Write-Host "information via Windows WMI and Lenovo EC interfaces." -ForegroundColor Gray
+    Write-Host ""
+
+    Write-Host ("=" * 47)
+    Write-Host ""
+
+    # Legal notices - plain text, no hyperlinks (console environment)
+    Write-Host "Legal" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "This project is not affiliated with or endorsed" -ForegroundColor DarkGray
+    Write-Host "by Lenovo. ThinkPad is a trademark of Lenovo." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "This script is provided for educational and" -ForegroundColor DarkGray
+    Write-Host "diagnostic purposes only. It makes no modifications" -ForegroundColor DarkGray
+    Write-Host "to system configuration, firmware, or settings." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "Lenovo is not responsible for the performance or" -ForegroundColor DarkGray
+    Write-Host "safety of unauthorized batteries, and provides no" -ForegroundColor DarkGray
+    Write-Host "warranties for failure or damage arising from" -ForegroundColor DarkGray
+    Write-Host "their use." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "Battery age estimation results are statistical" -ForegroundColor DarkGray
+    Write-Host "approximations. Actual age may vary based on usage" -ForegroundColor DarkGray
+    Write-Host "habits, temperature, and service history." -ForegroundColor DarkGray
+    Write-Host ""
+
+    Write-Host ("=" * 47)
+    Write-Host ""
+
+    # Third-party notices
+    Write-Host "Third-Party Notices" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Battery degradation model based on published" -ForegroundColor DarkGray
+    Write-Host "Li-ion cycle life research. Design capacity" -ForegroundColor DarkGray
+    Write-Host "resolved via powercfg /batteryreport (Windows" -ForegroundColor DarkGray
+    Write-Host "built-in utility) as a fallback data source." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "Genuine manufacturer detection list sourced from" -ForegroundColor DarkGray
+    Write-Host "Lenovo Material Safety Data Sheets and ThinkPad" -ForegroundColor DarkGray
+    Write-Host "community hardware research." -ForegroundColor DarkGray
+    Write-Host ""
+
+    Write-Host ("=" * 47)
+    Write-Host ""
+
+    # Privacy notice
+    Write-Host "Privacy" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "This script runs entirely on the local machine." -ForegroundColor DarkGray
+    Write-Host "No data is transmitted, collected, or stored" -ForegroundColor DarkGray
+    Write-Host "outside of the optional local export report." -ForegroundColor DarkGray
+    Write-Host ""
+
+    Read-Host "Press ENTER"
+}
+
+
+function Test-LenovoNamespace {
+    try {
+        $lenovoNS = Get-CimInstance -CimSession $script:CimSession -Namespace root -ClassName __Namespace -ErrorAction SilentlyContinue | Where-Object Name -eq "Lenovo"
+        return $null -ne $lenovoNS
+    }
+    catch {
+        # Fallback: try to query a Lenovo class directly
+        try {
+            $null = Get-CimClass -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction SilentlyContinue
+            return $true
+        }
+        catch {
+            return $false
+        }
+    }
+}
+
+function Test-SifInstalled {
+    <#
+    .SYNOPSIS
+    Detects whether the Lenovo System Interface Foundation (SIF) driver package
+    is installed on this system.
+
+    .DESCRIPTION
+    SIF (formerly "Lenovo System Interface Foundation" or "System Interface
+    Foundation") is the Lenovo driver package that registers the root\Lenovo
+    WMI namespace and the EC-facing WMI classes (Lenovo_Odometer,
+    Lenovo_BiosSetting, Lenovo_WarrantyInformation, etc.).
+
+    Options 2 (Lenovo Battery Cycles) and 5 (Comprehensive Battery Analysis)
+    depend on SIF. Without it, the root\Lenovo namespace does not exist and
+    every WMI call against it will fail with 0x8004100E (Invalid Namespace).
+
+    Detection strategy (most-to-least reliable):
+      1. Registry uninstall key scan (HKLM Uninstall hives, 64-bit and 32-bit).
+         Reads DisplayName values directly from the Windows installer database
+         without invoking Win32_Product, which triggers a full MSI consistency
+         check and can cause unintended repair actions on every installed package.
+      2. Lenovo-specific registry key written by the SIF installer.
+      3. SIF service presence (ImControllerService / sifservice).
+    Returns $true if SIF appears to be installed, $false otherwise.
+    #>
+
+    # Strategy 1: Registry uninstall key scan.
+    # Checks both the 64-bit and 32-bit (WOW6432Node) uninstall hives so the
+    # detection works regardless of whether SIF was installed as a 32-bit or
+    # 64-bit package. Reading registry values is instantaneous and has no
+    # side effects, unlike Win32_Product which triggers MSI reconfiguration.
+    $uninstallPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    try {
+        foreach ($regPath in $uninstallPaths) {
+            if (-not (Test-Path $regPath)) { continue }
+            $found = Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue |
+                ForEach-Object { Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue } |
+                Where-Object { $_.DisplayName -match "System Interface Foundation|Lenovo Service Bridge" } |
+                Select-Object -First 1
+            if ($found) { return $true }
+        }
+    } catch {}
+
+    # Strategy 2: Lenovo-specific registry key written by the SIF installer.
+    try {
+        if (Test-Path "HKLM:\SOFTWARE\Lenovo\SystemInterfaceFoundation") { return $true }
+        if (Test-Path "HKLM:\SOFTWARE\WOW6432Node\Lenovo\SystemInterfaceFoundation") { return $true }
+    } catch {}
+
+    # Strategy 3: SIF service presence.
+    try {
+        $svc = Get-Service -Name "ImControllerService","sifservice" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -ne $null } |
+            Select-Object -First 1
+        if ($svc) { return $true }
+    } catch {}
+
+    return $false
+}
+
+function Test-CommercialVantage {
+    <#
+    .SYNOPSIS
+    Detects whether Lenovo Commercial Vantage (or its predecessor, Lenovo Vantage
+    Enterprise) is installed and has deployed the CDRT Odometer WMI classes.
+
+    .DESCRIPTION
+    The CDRT (Commercial Deployment Readiness Tool) Odometer solution is deployed
+    by Lenovo Commercial Vantage. It registers custom WMI classes in root\Lenovo
+    that track the cumulative life story of the ThinkPad hardware: CPU uptime,
+    accelerometer shock events, and thermal throttle events.
+
+    These classes are distinct from the SIF-provided Lenovo_Odometer fields —
+    they are written by the CDRT MOF files and may or may not be present even
+    when SIF is installed. Commercial Vantage is common in corporate/enterprise
+    environments and is typically deployed via MDM or SCCM.
+
+    Detection strategy:
+      1. Lenovo-specific registry key written by the Commercial Vantage installer.
+      2. Registry uninstall key scan (HKLM Uninstall hives, 64-bit and 32-bit).
+         Reads DisplayName values directly — no Win32_Product, no MSI side effects.
+      3. Service presence check for the Commercial Vantage service.
+      4. Direct WMI class probe on Lenovo_Odometer in root\Lenovo —
+         if the class exists and exposes CPU_uptime, CDRT is deployed regardless
+         of how Commercial Vantage was detected.
+    Returns $true if Commercial Vantage / CDRT appears present, $false otherwise.
+    #>
+
+    # Strategy 1: Lenovo-specific registry key written by the CV installer.
+    try {
+        if (Test-Path "HKLM:\SOFTWARE\Lenovo\Commercial Vantage")             { return $true }
+        if (Test-Path "HKLM:\SOFTWARE\WOW6432Node\Lenovo\Commercial Vantage") { return $true }
+    } catch {}
+
+    # Strategy 2: Registry uninstall key scan.
+    # Avoids Win32_Product entirely — reading DisplayName from the uninstall
+    # hive is instantaneous and triggers no MSI reconfiguration or repair.
+    $uninstallPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    try {
+        foreach ($regPath in $uninstallPaths) {
+            if (-not (Test-Path $regPath)) { continue }
+            $found = Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue |
+                ForEach-Object { Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue } |
+                Where-Object { $_.DisplayName -match "Commercial Vantage|Vantage Enterprise" } |
+                Select-Object -First 1
+            if ($found) { return $true }
+        }
+    } catch {}
+
+    # Strategy 3: Service
+    try {
+        $svc = Get-Service -Name "LenovoVantageService","ImControllerService" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match "Vantage" } |
+            Select-Object -First 1
+        if ($svc) { return $true }
+    } catch {}
+
+    # Strategy 4: Direct WMI class probe — CDRT fields present on the class
+    try {
+        $cls = Get-CimClass -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction SilentlyContinue
+        if ($cls -and ($cls.CimClassProperties | Where-Object { $_.Name -match "CPU_uptime|cpu_uptime" })) {
+            return $true
+        }
+    } catch {}
+
+    return $false
+}
+
+function Get-CdrtOdometerData {
+    <#
+    .SYNOPSIS
+    Queries the CDRT Odometer fields from Lenovo_Odometer in root\Lenovo.
+
+    .DESCRIPTION
+    The CDRT solution extends Lenovo_Odometer with additional properties that
+    track the cumulative hardware life story of the ThinkPad beyond what the
+    base SIF Odometer exposes:
+
+      CPU_uptime       - Total cumulative minutes the CPU has been active.
+                         The raw WMI value is in minutes; this function converts
+                         it to hours and exposes both values on the result object.
+      Shock_events     - Cumulative count of accelerometer events that exceeded
+                         the CDRT vibration threshold. This includes minor bumps,
+                         desk impacts, and bag movement in addition to actual drops.
+                         High counts are normal for a well-travelled machine.
+      Thermal_events   - Number of times the system reached a critical temperature
+                         and throttled the CPU.
+
+    Property name casing may vary between firmware and CDRT versions. This
+    function probes both common variants (CPU_uptime / cpu_uptime) and falls
+    back gracefully if a property is absent.
+
+    Returns a PSCustomObject with:
+      CpuUptimeMinutes - Raw WMI value in minutes, or $null if unavailable
+      CpuUptimeHours   - CpuUptimeMinutes / 60 (rounded), or $null if unavailable
+      ShockEvents      - Numeric value, or $null if unavailable
+      ThermalEvents   - Numeric value, or $null if unavailable
+      RawObject       - The full WMI object for caller inspection
+      Available       - $true if the class was queried successfully
+      UnavailableReason - Populated when Available is $false
+    #>
+
+    $result = [PSCustomObject]@{
+        CpuUptimeMinutes  = $null
+        CpuUptimeHours    = $null
+        ShockEvents       = $null
+        ThermalEvents     = $null
+        RawObject         = $null
+        Available         = $false
+        UnavailableReason = ""
+    }
+
+    if (-not (Test-LenovoNamespace)) {
+        $result.UnavailableReason = "root\Lenovo namespace not available. SIF is not installed."
+        return $result
+    }
+
+    if (-not (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Odometer")) {
+        $result.UnavailableReason = "Lenovo_Odometer class not found in root\Lenovo."
+        return $result
+    }
+
+    try {
+        $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
+        $result.RawObject = $odo
+        $result.Available = $true
+
+        # CPU uptime — probe both known property name variants
+        foreach ($propName in @("CPU_uptime", "cpu_uptime", "CPUUptime")) {
+            try {
+                $val = $odo.$propName
+                if ($null -ne $val) {
+                    [int64]$parsed = 0
+                    if ([int64]::TryParse(($val -replace '\D',''), [ref]$parsed)) {
+                        # Raw WMI value is in minutes. Store both the
+                        # raw minutes and the derived hours so callers can
+                        # display either without re-dividing.
+                        $result.CpuUptimeMinutes = $parsed
+                        $result.CpuUptimeHours   = [math]::Round($parsed / 60, 1)
+                        break
+                    }
+                }
+            } catch {}
+        }
+
+        # Shock events
+        foreach ($propName in @("Shock_events", "shock_events", "ShockEvents")) {
+            try {
+                $val = $odo.$propName
+                if ($null -ne $val) {
+                    [int64]$parsed = 0
+                    if ([int64]::TryParse(($val -replace '\D',''), [ref]$parsed)) {
+                        $result.ShockEvents = $parsed
+                        break
+                    }
+                }
+            } catch {}
+        }
+
+        # Thermal events
+        foreach ($propName in @("Thermal_events", "thermal_events", "ThermalEvents")) {
+            try {
+                $val = $odo.$propName
+                if ($null -ne $val) {
+                    [int64]$parsed = 0
+                    if ([int64]::TryParse(($val -replace '\D',''), [ref]$parsed)) {
+                        $result.ThermalEvents = $parsed
+                        break
+                    }
+                }
+            } catch {}
+        }
+
+        # If CPU uptime is still null, the CDRT MOF was not deployed —
+        # SIF Odometer is present but the CDRT extension fields are missing
+        if ($null -eq $result.CpuUptimeMinutes -and $null -eq $result.ShockEvents -and $null -eq $result.ThermalEvents) {
+            $result.Available         = $false
+            $result.UnavailableReason = "Lenovo_Odometer exists but CDRT fields (CPU_uptime, Shock_events, Thermal_events) were not found. Commercial Vantage may not be installed or the CDRT MOF has not been deployed."
+        }
+    }
+    catch {
+        Log-Error "root\Lenovo" "Lenovo_Odometer (CDRT)" $_
+        $result.Available         = $false
+        $result.UnavailableReason = "Query failed: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Show-CdrtOdometer {
+    Show-Header
+    Write-Host "[ CDRT Odometer - ThinkPad Life Story ]"
+    Write-Host ""
+
+    # ── Prerequisite: root\Lenovo namespace (SIF) ────────────────────────
+    if (-not (Test-LenovoNamespace)) {
+        Get-LenovoNamespaceUnavailableMessage -Feature "the CDRT Odometer"
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    # ── Check Commercial Vantage ─────────────────────────────────────────
+    $cvInstalled = Test-CommercialVantage
+    if (-not $cvInstalled) {
+        Write-Host "Lenovo Commercial Vantage is not detected on this system." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "What is the CDRT Odometer?" -ForegroundColor Cyan
+        Write-Host "The Commercial Deployment Readiness Tool (CDRT) Odometer is deployed"
+        Write-Host "by Lenovo Commercial Vantage. It registers custom WMI classes that"
+        Write-Host "record the cumulative hardware life story of your ThinkPad, tracking:"
+        Write-Host "  - CPU Uptime      : Total hours the CPU has been active"
+        Write-Host "  - Shock Events    : Accelerometer events above the CDRT vibration threshold"
+        Write-Host "  - Thermal Events  : Times the CPU throttled due to critical temperature"
+        Write-Host ""
+        Write-Host "This data is valuable for enterprise asset management and pre-owned" 
+        Write-Host "ThinkPad evaluation."
+        Write-Host ""
+        Write-Host "How to get Lenovo Commercial Vantage:" -ForegroundColor Cyan
+        Write-Host "  - Microsoft Store: search 'Lenovo Commercial Vantage'"
+        Write-Host "  - support.lenovo.com -> Drivers & Software"
+        Write-Host "  - Enterprise: deploy via SCCM or MDM using the Lenovo CDRT package"
+        Write-Host ""
+        Write-Host "Note: Commercial Vantage is intended for business/enterprise ThinkPads." -ForegroundColor DarkGray
+        Write-Host "Consumer models may use Lenovo Vantage instead, which does not" -ForegroundColor DarkGray
+        Write-Host "include the CDRT Odometer." -ForegroundColor DarkGray
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    # ── Query CDRT data ──────────────────────────────────────────────────
+    Write-Host "Querying CDRT Odometer data..." -ForegroundColor Cyan
+    Write-Host ""
+
+    $cdrt = Get-CdrtOdometerData
+
+    if (-not $cdrt.Available) {
+        Write-Host "CDRT Odometer data unavailable." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Reason: $($cdrt.UnavailableReason)" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "Commercial Vantage was detected on this system, but the CDRT" -ForegroundColor Yellow
+        Write-Host "Odometer fields were not found in Lenovo_Odometer." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "This can occur when:" -ForegroundColor Yellow
+        Write-Host "  - Commercial Vantage is installed but the CDRT MOF has not been deployed"
+        Write-Host "  - The CDRT package requires a separate deployment via SCCM/MDM"
+        Write-Host "  - This ThinkPad model predates CDRT Odometer support"
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    Write-Host "[ ThinkPad Life Story ]"
+    Write-Host ("-" * 50)
+
+    # CPU Uptime
+    # Raw WMI value is in minutes. Convert to hours and days for display.
+    Write-Host "CPU Uptime             : " -NoNewline
+    if ($null -ne $cdrt.CpuUptimeMinutes) {
+        $totalHours = [math]::Round($cdrt.CpuUptimeMinutes / 60, 1)
+        $days       = [math]::Floor($totalHours / 24)
+        $hrs        = [math]::Round($totalHours % 24, 1)
+        Write-Host "$($cdrt.CpuUptimeMinutes) min  (~$totalHours hours / $days days, $hrs hrs)" -ForegroundColor Cyan
+    } else {
+        Write-Host "Unavailable" -ForegroundColor Yellow
+    }
+
+    # Shock Events
+    # The CDRT accelerometer threshold is sensitive — counts include minor bumps,
+    # vibrations, and bag movement, not just actual drops. Thresholds are set
+    # accordingly: counts in the hundreds are normal for a well-travelled machine.
+    Write-Host "Shock Events           : " -NoNewline
+    if ($null -ne $cdrt.ShockEvents) {
+        $shockColor = if ($cdrt.ShockEvents -lt 100) { "Green" } elseif ($cdrt.ShockEvents -lt 1000) { "Yellow" } else { "Red" }
+        Write-Host $cdrt.ShockEvents -ForegroundColor $shockColor
+        Write-Host "  Note: Counts accelerometer events above the CDRT vibration threshold." -ForegroundColor DarkGray
+        Write-Host "        Includes minor bumps and movement — not only actual drops." -ForegroundColor DarkGray
+    } else {
+        Write-Host "Unavailable" -ForegroundColor Yellow
+    }
+
+    # Thermal Events
+    Write-Host "Thermal Events         : " -NoNewline
+    if ($null -ne $cdrt.ThermalEvents) {
+        $thermalColor = if ($cdrt.ThermalEvents -eq 0) { "Green" } elseif ($cdrt.ThermalEvents -lt 10) { "Yellow" } else { "Red" }
+        Write-Host $cdrt.ThermalEvents -ForegroundColor $thermalColor
+        if ($cdrt.ThermalEvents -gt 0) {
+            Write-Host "  Note: Each event represents a CPU throttle due to critical temperature." -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "Unavailable" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "Source: CDRT Odometer via Lenovo_Odometer (root\Lenovo)" -ForegroundColor DarkGray
+    Write-Host "Data reflects cumulative lifetime counts since CDRT deployment." -ForegroundColor DarkGray
+    Write-Host ""
+    Read-Host "Press ENTER"
+}
+
+function Test-WmiClass {
+    param(
+        [string]$Namespace = "root\cimv2",
+        [string]$ClassName
+    )
+    
+    try {
+        $class = Get-CimClass -Namespace $Namespace -ClassName $ClassName -ErrorAction SilentlyContinue
+        return $null -ne $class
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-SafeWmiProperty {
+    param(
+        [object]$Object,
+        [string]$PropertyName,
+        [object]$DefaultValue = "Unavailable"
+    )
+    
+    try {
+        if ($Object -and $null -ne $Object.$PropertyName) {
+            return $Object.$PropertyName
+        }
+    }
+    catch {
+        # Silently fail and return default
+    }
+    
+    return $DefaultValue
+}
+
+function Get-MemoryState {
+    <#
+    .SYNOPSIS
+    Retrieves physical memory information from Win32_PhysicalMemory.
+    
+    .DESCRIPTION
+    Queries system memory modules and returns capacity, speed, manufacturer info,
+    and detects speed mismatches between modules.
+    
+    .OUTPUTS
+    PSCustomObject with properties:
+    - TotalRAMGB: Total system RAM in gigabytes
+    - ModuleCount: Number of physical memory modules
+    - SpeedMismatch: Boolean indicating if modules have different speeds
+    - Severity: 0 for matched speeds, 1 for mismatched speeds
+    - Modules: Array of module details (Capacity, Speed, Manufacturer)
+    #>
+    
+    $result = [PSCustomObject]@{
+        TotalRAMGB = 0
+        ModuleCount = 0
+        SpeedMismatch = $false
+        Severity = 0
+        Modules = @()
+        Message = ""
+    }
+    
+    try {
+        if (-not (Test-WmiClass -ClassName "Win32_PhysicalMemory")) {
+            $result.Message = "Win32_PhysicalMemory class not available on this system."
+            return $result
+        }
+        
+        $modules = @(Get-CimInstance -CimSession $script:CimSession -ClassName Win32_PhysicalMemory -ErrorAction SilentlyContinue)
+        
+        if (-not $modules -or $modules.Count -eq 0) {
+            $result.Message = "No physical memory modules found."
+            return $result
+        }
+        
+        $result.ModuleCount = $modules.Count
+        $speeds = @()
+        $totalBytes = 0
+        
+        foreach ($module in $modules) {
+            try {
+                $capacity = Get-SafeWmiProperty -Object $module -PropertyName "Capacity"
+                $speed = Get-SafeWmiProperty -Object $module -PropertyName "Speed"
+                $manufacturer = Get-SafeWmiProperty -Object $module -PropertyName "Manufacturer"
+                $deviceLocator = Get-SafeWmiProperty -Object $module -PropertyName "DeviceLocator"
+                
+                # Parse capacity to numeric value
+                [int64]$capacityBytes = 0
+                if ($capacity -and $capacity -ne "Unavailable" -and [int64]::TryParse($capacity.ToString(), [ref]$capacityBytes)) {
+                    $totalBytes += $capacityBytes
+                }
+                
+                # Parse speed to numeric value
+                [int32]$speedValue = 0
+                if ($speed -and $speed -ne "Unavailable" -and [int32]::TryParse($speed.ToString(), [ref]$speedValue)) {
+                    $speeds += $speedValue
+                }
+                
+                $result.Modules += [PSCustomObject]@{
+                    DeviceLocator = $deviceLocator
+                    CapacityGB = if ($capacityBytes -gt 0) { [math]::Round($capacityBytes / 1GB, 2) } else { "Unavailable" }
+                    CapacityBytes = $capacityBytes
+                    SpeedMHz = if ($speedValue -gt 0) { $speedValue } else { "Unavailable" }
+                    Manufacturer = $manufacturer
+                }
+            }
+            catch {
+                Log-Error "root\cimv2" "Win32_PhysicalMemory" $_
+            }
+        }
+        
+        # Calculate total RAM in GB
+        if ($totalBytes -gt 0) {
+            $result.TotalRAMGB = [math]::Round($totalBytes / 1GB, 2)
+        }
+        
+        # Detect speed mismatch
+        if ($speeds.Count -gt 1) {
+            $uniqueSpeeds = $speeds | Select-Object -Unique
+            if ($uniqueSpeeds.Count -gt 1) {
+                $result.SpeedMismatch = $true
+                $result.Severity = 1
+                $result.Message = "Warning: Memory modules have mismatched speeds. This may impact performance."
+            }
+            else {
+                $result.Message = "All memory modules have matching speeds."
+            }
+        }
+        elseif ($speeds.Count -eq 1) {
+            $result.Message = "Single memory module detected."
+        }
+        else {
+            $result.Message = "Unable to determine memory speeds."
+        }
+        
+        return $result
+    }
+    catch {
+        Log-Error "root\cimv2" "Win32_PhysicalMemory" $_
+        $result.Message = "Failed to retrieve memory information."
+        return $result
+    }
+}
+
+function MemoryInfo {
+    Show-Header
+    Write-Host "[ Memory Information - Win32_PhysicalMemory ]"
+    Write-Host ""
+
+    $memoryState = Get-MemoryState
+
+    if (-not [string]::IsNullOrEmpty($memoryState.Message) -and $memoryState.ModuleCount -eq 0) {
+        $failColor = if ($memoryState.Message -match "Failed") { "Red" } else { "Yellow" }
+        Write-Host $memoryState.Message -ForegroundColor $failColor
+    }
+    else {
+        Write-Host "Total RAM              : $($memoryState.TotalRAMGB) GB"
+        Write-Host "Module Count           : $($memoryState.ModuleCount)"
+        Write-Host ""
+
+        # Determine color based on speed mismatch
+        $statusColor = if ($memoryState.SpeedMismatch) { "Yellow" } else { "Green" }
+        Write-Host "Speed Mismatch         : " -NoNewline
+        Write-Host $(if ($memoryState.SpeedMismatch) { "Yes" } else { "No" }) -ForegroundColor $statusColor
+
+        if ($memoryState.SpeedMismatch) {
+            Write-Host "Severity               : " -NoNewline
+            Write-Host "Warning ($($memoryState.Severity)/1)" -ForegroundColor Yellow
+        }
+
+        Write-Host ""
+        Write-Host "[ Memory Module Details ]"
+        Write-Host ""
+
+        $moduleIndex = 0
+        foreach ($module in $memoryState.Modules) {
+            Write-Host "Module #: $moduleIndex"
+            Write-Host ("-" * 50)
+            Write-Host "Location        : $($module.DeviceLocator)"
+            Write-Host "Capacity        : $($module.CapacityGB) GB"
+            Write-Host "Speed           : $($module.SpeedMHz) MHz"
+            Write-Host "Manufacturer    : $($module.Manufacturer)"
+            Write-Host ""
+            $moduleIndex++
+        }
+
+        Write-Host "[ Status ]"
+        Write-Host $memoryState.Message -ForegroundColor $statusColor
+    }
+
+    Read-Host "Press ENTER"
+}
+
+Show-Disclaimer
+
+# Initialise the shared CIM session now that elevation is confirmed.
+# Must be called after Show-Disclaimer so UAC self-elevation has already
+# completed and the process token is elevated before connecting.
+New-ScriptCimSession
+
+# Query battery health once at startup and cache it in $script:BatteryAlert.
+# This runs silently in the background — the result is surfaced in Show-Header
+# and the main menu so reactive users see the alert the moment they open the script.
+$null = Get-BatteryAlertState
+
+
+function Show-ErrorLog {
+    Show-Header
+    Write-Host "[ Error Log Viewer ]"
+    Write-Host ""
+
+    if ($script:ErrorLog.Count -eq 0) {
+        Write-Host "No errors logged this session." -ForegroundColor Green
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    Write-Host "Total errors this session: $($script:ErrorLog.Count)" -ForegroundColor Red
+    Write-Host ""
+
+    $index = 0
+    foreach ($err in $script:ErrorLog) {
+        $index++
+        Write-Host ("=" * 50) -ForegroundColor DarkGray
+        Write-Host "Error #$index" -ForegroundColor Red
+        Write-Host ("=" * 50) -ForegroundColor DarkGray
+
+        Write-Host "Time      : $($err.TimeStamp)"
+        Write-Host "Namespace : $($err.Namespace)"
+        Write-Host "Class     : $($err.Class)"
+
+        Write-Host "Message   : " -NoNewline
+        Write-Host $err.Message -ForegroundColor Yellow
+
+        if ($err.Context) {
+            Write-Host "Context   : $($err.Context)"
+        }
+
+        if ($err.ScriptName -or $err.ScriptLineNumber) {
+            Write-Host "Location  : $($err.ScriptName) line $($err.ScriptLineNumber)" -ForegroundColor DarkGray
+        }
+
+        if ($err.BatteryDetails) {
+            Write-Host "Battery   :"
+            Write-Host "  InstanceName        : $($err.BatteryDetails.InstanceName)" -ForegroundColor DarkGray
+            Write-Host "  FullChargedCapacity : $($err.BatteryDetails.FullChargedCapacity)" -ForegroundColor DarkGray
+            Write-Host "  DesignedCapacity    : $($err.BatteryDetails.DesignedCapacity)" -ForegroundColor DarkGray
+        }
+
+        if ($err.StackTrace) {
+            Write-Host "Stack     :" -ForegroundColor DarkGray
+            # Print each stack frame on its own line, indented
+            $err.StackTrace -split "`n" | ForEach-Object {
+                Write-Host "  $($_.Trim())" -ForegroundColor DarkGray
+            }
+        }
+
+        Write-Host ""
+    }
+
+    Read-Host "Press ENTER"
+}
+
+do {
+    Show-Header
+
+    # Build alert suffix for battery-related menu items
+    # Shown next to Options 4 and 5 when any battery is Fair, Poor, or Critical
+    $alertSuffix = ""
+    $alertColor  = "White"
+    if ($script:BatteryAlert -and $script:BatteryAlert.Available -and $script:BatteryAlert.WorstSeverity -ge 1) {
+        $alertSuffix = "  [!] $($script:BatteryAlert.SummaryLine)"
+        $alertColor  = switch ($script:BatteryAlert.WorstSeverity) {
+            1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
+            default { "White" }
+        }
+    }
+
+    Write-Host "1. Battery Static Data"
+    Write-Host "2. Lenovo Battery Cycles"
+    Write-Host "3. Warranty Info"
+    Write-Host -NoNewline "4. Full Charge Capacity"
+    if ($alertSuffix) { Write-Host $alertSuffix -ForegroundColor $alertColor } else { Write-Host "" }
+    Write-Host -NoNewline "5. Comprehensive Battery Analysis"
+    if ($alertSuffix) { Write-Host $alertSuffix -ForegroundColor $alertColor } else { Write-Host "" }
+    Write-Host "6. Memory Info"
+    Write-Host "7. Export Report"
+    Write-Host "8. Diagnostic Info"
+    Write-Host "9. Battery Age Estimation"
+    Write-Host "10. Battery Charge Threshold"
+    Write-Host "11. CDRT Odometer"
+    Write-Host "12. About"
+    Write-Host "13. Error Log Viewer"
+    Write-Host "14. Exit"
+    Write-Host ""
+
+    $choice = Read-Host "Select option"
+
+    switch ($choice) {
+        "1" { BatteryStaticData }
+        "2" { LenovoEC }
+        "3" { WarrantyInfo }
+        "4" { FullCharge }
+        "5" { ComprehensiveBatteryAnalysis }
+        "6" { MemoryInfo }
+        "7" { ExportReport }
+        "8" { DiagnosticInfo }
+        "9" { BatteryAgeEstimation }
+        "10" { ChargeThresholdManager }
+        "11" { Show-CdrtOdometer }
+        "12" { Show-About }
+        "13" { Show-ErrorLog }
+    }
+
+} while ($choice -ne "14")
+
+# Tear down the shared CIM session cleanly before exiting.
+if ($script:CimSession) {
+    Remove-CimSession -CimSession $script:CimSession -ErrorAction SilentlyContinue
+    $script:CimSession = $null
+}
+
+Clear-Host
+Write-Host "Exiting..."
