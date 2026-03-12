@@ -1,7 +1,10 @@
-# ThinkPad-Utility-Management
+# ThinkPad Utility Management
+Windows PowerShell diagnostic tool for ThinkPad hardware
+
 A read-only diagnostic tool that reads battery health, cycle data, EC telemetry, warranty information, and memory configuration directly from Windows WMI and Lenovo EC interfaces.
 
 > This project is not affiliated with or endorsed by Lenovo. ThinkPad is a trademark of Lenovo.
+
 ---
 
 ## Requirements
@@ -11,7 +14,7 @@ A read-only diagnostic tool that reads battery health, cycle data, EC telemetry,
 | OS | Windows 10 / 11 |
 | Shell | Windows PowerShell 5.1 or PowerShell 7+ |
 | Privileges | **Administrator** (required — see below) |
-| Lenovo SIF | Required for Options 2, 5, 11 |
+| Lenovo SIF | Required for Options 2, 3, 5, 10, 11 |
 | Commercial Vantage | Required for Option 11 (CDRT Odometer) |
 
 ---
@@ -214,6 +217,48 @@ This overrides the policy for that one invocation only and does not change the s
 
 ---
 
+## Battery Health Classification
+
+Battery health is reported across five tiers based on capacity percentage and cycle count. The severity level drives the colour used in the header and menu alert on every screen.
+
+| Classification | Health % | Severity | Colour |
+|---|---|---|---|
+| Good | ≥ 80% | 0 | White |
+| Warning | 60–79% | 1 | Cyan |
+| Fair | 40–59% | 2 | Yellow |
+| Poor | < 40% | 3 | Magenta |
+| Critical | < 20% or status failure | 4 | Red |
+
+Cycle count is factored in alongside capacity: a battery with more than 1,000 cycles and below 60% capacity is classified as Poor regardless of the capacity threshold alone; more than 1,500 cycles triggers Critical. A battery whose WMI status reports a failure keyword (`Failed`, `Critical`, `Error`, `Degraded`) is always classified as Critical.
+
+The **Warning** tier aligns with Lenovo Vantage's updated alert threshold, which flags batteries below 80% as needing attention.
+
+---
+
+## Genuine Battery Detection
+
+The script checks the battery manufacturer string against a list of known Lenovo-authorised suppliers. A warning is shown for any battery whose manufacturer does not match a known entry.
+
+The built-in list covers the following suppliers: LENOVO, PANASONIC, SANYO, SONY, MURATA, LGC, LG, SDI, SAMSUNG, CELXPERT, ATL, COSMX, BYD, NVT, SUNWODA, SMP.
+
+To extend detection without editing the script, place a `manufacturers.json` file in the same directory as the `.ps1` file. If the file is present and valid, it replaces the built-in list entirely. If it is missing, unreadable, or empty, the script falls back to the built-in list silently.
+
+**`manufacturers.json` format**
+
+```json
+{
+  "genuineManufacturers": [
+    { "name": "LENOVO",   "fullName": "Lenovo",                      "region": "CN", "notes": "" },
+    { "name": "CELXPERT", "fullName": "Celxpert Electronics Corp.",   "region": "TW", "notes": "Confirmed Lenovo-authorised supplier" },
+    { "name": "NEWMFR",   "fullName": "New Manufacturer Inc.",        "region": "XX", "notes": "" }
+  ]
+}
+```
+
+Only the `name` field is required. It is matched case-insensitively as a substring against the manufacturer string reported by the battery firmware.
+
+---
+
 ## Driver Dependencies
 
 ### Lenovo System Interface Foundation (SIF)
@@ -241,6 +286,6 @@ This script runs entirely on the local machine. No data is transmitted, collecte
 
 This project is not affiliated with or endorsed by Lenovo. ThinkPad is a trademark of Lenovo.
 
-Provided for educational and diagnostic purposes only. Battery age estimation results are statistical approximations. Actual age may vary based on usage habits, temperature, and service history.
+Provided for educational and diagnostic purposes only. This script makes no modifications to system configuration, firmware, or settings. Battery age estimation results are statistical approximations. Actual age may vary based on usage habits, temperature, and service history.
 
 Built with Windows PowerShell, ChatGPT GPT 5.4, and Claude Sonnet 4.6.
