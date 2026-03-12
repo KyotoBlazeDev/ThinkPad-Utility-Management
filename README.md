@@ -168,7 +168,6 @@ All of these are paid certificates. The certificate must be an **Extended Valida
 **Sign with a CA-issued certificate**
 
 ```powershell
-# Retrieve the certificate from your store (filter by thumbprint or subject)
 $cert = Get-ChildItem Cert:\CurrentUser\My |
     Where-Object { $_.Subject -match "YourName" -and $_.HasPrivateKey } |
     Select-Object -First 1
@@ -192,7 +191,7 @@ If you are testing on a machine you control and do not want to deal with certifi
 powershell.exe -ExecutionPolicy Bypass -File .\ThinkPad_Utility_Management.ps1
 ```
 
-This overrides the policy for that one invocation only and does not change the system-wide setting. **Do not use this in production or enterprise deployments** — it defeats the purpose of having an execution policy.
+This overrides the policy for that one invocation only and does not change the system-wide setting. **Do not use this in production or enterprise deployments.**
 
 ---
 
@@ -219,7 +218,7 @@ This overrides the policy for that one invocation only and does not change the s
 
 ## Battery Health Classification
 
-Battery health is reported across five tiers based on capacity percentage and cycle count. The severity level drives the colour used in the header and menu alert on every screen.
+Battery health is evaluated using capacity percentage and cycle count and reported across five tiers. The severity level drives the colour shown in the header and menu alert on every screen.
 
 | Classification | Health % | Severity | Colour |
 |---|---|---|---|
@@ -229,28 +228,79 @@ Battery health is reported across five tiers based on capacity percentage and cy
 | Poor | < 40% | 3 | Magenta |
 | Critical | < 20% or status failure | 4 | Red |
 
-Cycle count is factored in alongside capacity: a battery with more than 1,000 cycles and below 60% capacity is classified as Poor regardless of the capacity threshold alone; more than 1,500 cycles triggers Critical. A battery whose WMI status reports a failure keyword (`Failed`, `Critical`, `Error`, `Degraded`) is always classified as Critical.
+Cycle count is factored in alongside capacity percentage:
+
+- More than 500 cycles and below 75% capacity → **Fair**
+- More than 1,000 cycles and below 60% capacity → **Poor**
+- More than 1,500 cycles → **Critical**
+
+A battery whose WMI status reports a failure keyword (`Failed`, `Critical`, `Error`, `Degraded`) is always classified as **Critical** regardless of capacity.
 
 The **Warning** tier aligns with Lenovo Vantage's updated alert threshold, which flags batteries below 80% as needing attention.
 
 ---
 
+## Battery Age Estimation (Option 9)
+
+Age is estimated using two independent methods that are cross-validated against each other.
+
+**Method 1 — Cycle-based.** Assumes a conservative baseline of 250 charge cycles per year, derived from ASUS, Lenovo, and independent battery longevity studies.
+
+**Method 2 — Capacity-based.** Uses a simplified linear degradation model: 100% health corresponds to a new battery (0 years), and full degradation corresponds to approximately 5 years — equating to roughly 4% capacity loss per year.
+
+When both methods are available, a weighted average is used (45% cycle-based, 55% capacity-based) with a confidence rating:
+
+| Confidence | Condition |
+|---|---|
+| High | Both estimates agree within 1 year |
+| Medium | Estimates diverge by 1–2 years, or only one data source is available |
+| Low | Estimates diverge by more than 2 years |
+
+Results are statistical approximations. Actual age may vary based on usage habits, storage temperature, and whether the battery has been replaced.
+
+---
+
+## Battery Charge Threshold Manager (Option 10)
+
+Reads and writes battery charge thresholds directly to the ThinkPad BIOS/EC firmware via `Lenovo_BiosSetting`, `Lenovo_SetBiosSetting`, and `Lenovo_SaveBiosSettings` in `root\wmi`.
+
+**Important notes before changing thresholds:**
+
+- Changes are written directly to firmware and take effect on the **next reboot**.
+- Start threshold must always be lower than Stop threshold.
+- Recommended range: Start 40–75%, Stop 60–80%.
+- Setting Stop to 100% disables the upper limit.
+- A BIOS Supervisor Password may be required depending on system policy.
+- Not all ThinkPad models expose threshold settings via WMI.
+
+**WMI return codes:**
+
+| Code | Meaning |
+|---|---|
+| `Success` | Change staged — reboot required to apply |
+| `Not Supported` | Setting not available on this model |
+| `Invalid Parameter` | Value or setting name is incorrect |
+| `Access Denied` | BIOS Supervisor Password required |
+| `BIOS Error` | Firmware-level failure |
+
+---
+
 ## Genuine Battery Detection
 
-The script checks the battery manufacturer string against a list of known Lenovo-authorised suppliers. A warning is shown for any battery whose manufacturer does not match a known entry.
+The script checks the battery manufacturer string reported by firmware against a list of known Lenovo-authorised suppliers. A warning is displayed for any battery that does not match a known entry.
 
-The built-in list covers the following suppliers: LENOVO, PANASONIC, SANYO, SONY, MURATA, LGC, LG, SDI, SAMSUNG, CELXPERT, ATL, COSMX, BYD, NVT, SUNWODA, SMP.
+**Built-in supplier list:** LENOVO, PANASONIC, SANYO, SONY, MURATA, LGC, LG, SDI, SAMSUNG, CELXPERT, ATL, COSMX, BYD, NVT, SUNWODA, SMP.
 
-To extend detection without editing the script, place a `manufacturers.json` file in the same directory as the `.ps1` file. If the file is present and valid, it replaces the built-in list entirely. If it is missing, unreadable, or empty, the script falls back to the built-in list silently.
+To extend detection without editing the script, place a `manufacturers.json` file in the same directory as the `.ps1` file. If present and valid, it replaces the built-in list entirely. If missing, unreadable, or empty, the script falls back to the built-in list silently.
 
-**`manufacturers.json` format**
+**`manufacturers.json` format:**
 
 ```json
 {
   "genuineManufacturers": [
-    { "name": "LENOVO",   "fullName": "Lenovo",                      "region": "CN", "notes": "" },
-    { "name": "CELXPERT", "fullName": "Celxpert Electronics Corp.",   "region": "TW", "notes": "Confirmed Lenovo-authorised supplier" },
-    { "name": "NEWMFR",   "fullName": "New Manufacturer Inc.",        "region": "XX", "notes": "" }
+    { "name": "LENOVO",   "fullName": "Lenovo",                    "region": "CN", "notes": "" },
+    { "name": "CELXPERT", "fullName": "Celxpert Electronics Corp.", "region": "TW", "notes": "Confirmed Lenovo-authorised supplier" },
+    { "name": "NEWMFR",   "fullName": "New Manufacturer Inc.",      "region": "XX", "notes": "" }
   ]
 }
 ```
@@ -259,14 +309,32 @@ Only the `name` field is required. It is matched case-insensitively as a substri
 
 ---
 
+## CDRT Odometer (Option 11)
+
+The Commercial Deployment Readiness Tool (CDRT) Odometer is deployed by Lenovo Commercial Vantage. It extends `Lenovo_Odometer` in `root\Lenovo` with three cumulative lifetime counters:
+
+| Field | Description |
+|---|---|
+| CPU Uptime | Total cumulative minutes the CPU has been active, displayed as minutes, hours, and days |
+| Shock Events | Accelerometer events exceeding the CDRT vibration threshold — includes minor bumps and bag movement, not only drops. Counts in the hundreds are normal for a well-travelled machine. |
+| Thermal Events | Number of times the CPU throttled due to reaching a critical temperature |
+
+This data is valuable for enterprise asset management and pre-owned ThinkPad evaluation.
+
+---
+
 ## Driver Dependencies
 
 ### Lenovo System Interface Foundation (SIF)
-Required for Options 2, 3, 5, 10, and 11. SIF registers the `root\Lenovo` WMI namespace and the EC-facing classes (`Lenovo_Odometer`, `Lenovo_BiosSetting`, `Lenovo_WarrantyInformation`).
+
+Required for Options 2, 3, 5, 10, and 11. SIF registers the `root\Lenovo` WMI namespace and the EC-facing classes used by this script: `Lenovo_Odometer`, `Lenovo_Battery`, `Lenovo_BiosSetting`, `Lenovo_SetBiosSetting`, `Lenovo_SaveBiosSettings`, and `Lenovo_WarrantyInformation`.
 
 Install from: **support.lenovo.com** → Drivers & Software → search "System Interface Foundation"
 
+> The `root\Lenovo` namespace is a ThinkPad-exclusive firmware feature. It is not present on IdeaPad, Yoga, Legion, ThinkBook, or other Lenovo product lines by design — this cannot be resolved by installing SIF on a non-ThinkPad device.
+
 ### Lenovo Commercial Vantage
+
 Required for Option 11 (CDRT Odometer). Commercial Vantage deploys the CDRT MOF files that extend `Lenovo_Odometer` with CPU uptime, shock event, and thermal event tracking.
 
 - **Microsoft Store:** search "Lenovo Commercial Vantage"
@@ -276,9 +344,40 @@ Required for Option 11 (CDRT Odometer). Commercial Vantage deploys the CDRT MOF 
 
 ---
 
+## Data Sources
+
+The script queries multiple WMI sources per feature and falls back gracefully when a preferred source is unavailable.
+
+| WMI Class | Namespace | Used For |
+|---|---|---|
+| `Lenovo_Battery` | `root\Lenovo` | Full battery identity, health, charge state, electrical readings |
+| `Lenovo_Odometer` | `root\Lenovo` | Battery cycle count, shock events, thermal events, CDRT CPU uptime |
+| `Lenovo_BiosSetting` | `root\wmi` | Reading charge thresholds |
+| `Lenovo_SetBiosSetting` | `root\wmi` | Writing charge thresholds |
+| `Lenovo_SaveBiosSettings` | `root\wmi` | Committing BIOS changes |
+| `Lenovo_WarrantyInformation` | `root\Lenovo` | Warranty serial, start/end dates |
+| `BatteryFullChargedCapacity` | `root\wmi` | Full charge capacity (ACPI fallback) |
+| `BatteryStaticData` | `root\wmi` | Design capacity, manufacturer, serial number |
+| `Win32_Battery` | `root\cimv2` | Estimated charge percentage (fallback) |
+| `Win32_PhysicalMemory` | `root\cimv2` | RAM modules, capacity, speed, manufacturer |
+| `Win32_ComputerSystem` | `root\cimv2` | System model string |
+| `Win32_BIOS` | `root\cimv2` | BIOS version and release date |
+
+Design capacity is resolved from `BatteryStaticData` first, with `powercfg /batteryreport /XML` as a fallback if the WMI class returns zero or is unavailable.
+
+---
+
+## Export Report (Option 7)
+
+Generates a plain-text diagnostic report saved to `%USERPROFILE%\ThinkPad_Report.txt`. If any errors were logged during the session, a separate error log is saved to `%USERPROFILE%\ThinkPad_ErrorLog.txt`.
+
+The report includes: Windows battery data, Lenovo EC cycle/shock/thermal data, warranty information, full charge capacity, health analysis, and comprehensive battery classification.
+
+---
+
 ## Privacy
 
-This script runs entirely on the local machine. No data is transmitted, collected, or stored outside of the optional local export report (`ThinkPad_Report.txt`), which is written to `%USERPROFILE%` only when Option 7 is used.
+This script runs entirely on the local machine. No data is transmitted, collected, or stored outside of the optional local export report, which is written to `%USERPROFILE%` only when Option 7 is used.
 
 ---
 
@@ -286,6 +385,6 @@ This script runs entirely on the local machine. No data is transmitted, collecte
 
 This project is not affiliated with or endorsed by Lenovo. ThinkPad is a trademark of Lenovo.
 
-Provided for educational and diagnostic purposes only. This script makes no modifications to system configuration, firmware, or settings. Battery age estimation results are statistical approximations. Actual age may vary based on usage habits, temperature, and service history.
+Provided for educational and diagnostic purposes only. This script makes no modifications to system configuration, firmware, or settings outside of the explicit charge threshold write in Option 10, which requires deliberate user confirmation. Battery age estimation results are statistical approximations. Actual age may vary based on usage habits, temperature, and service history.
 
 Built with Windows PowerShell, ChatGPT GPT 5.4, and Claude Sonnet 4.6.
