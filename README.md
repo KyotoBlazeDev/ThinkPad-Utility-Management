@@ -381,6 +381,14 @@ This script runs entirely on the local machine. No data is transmitted, collecte
 
 ---
 
+## Power User Guide
+
+Want to build your own ThinkPad diagnostic tool using the same architecture?
+
+[Open the Power User Guide](POWER_USER_GUIDE.md)
+
+---
+
 ## Legal
 
 This project is not affiliated with or endorsed by Lenovo. ThinkPad is a trademark of Lenovo.
