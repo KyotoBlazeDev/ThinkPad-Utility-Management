@@ -1,0 +1,105 @@
+{
+  "_comment": "ThinkPad Utility Management — Genuine battery manufacturer lookup table.",
+  "_usage": "Add entries to genuineManufacturers to extend detection without editing the script.",
+  "_matching": "The 'name' field is matched case-insensitively against BatteryStaticData.ManufactureName via a substring match.",
+  "version": "1.0",
+  "lastUpdated": "2026-03-03",
+  "genuineManufacturers": [
+    {
+      "name": "LENOVO",
+      "fullName": "Lenovo",
+      "region": "CN",
+      "notes": "Lenovo-branded battery packs"
+    },
+    {
+      "name": "PANASONIC",
+      "fullName": "Panasonic Energy",
+      "region": "JP",
+      "notes": "Historic OEM supplier — IBM and early Lenovo ThinkPad era"
+    },
+    {
+      "name": "SANYO",
+      "fullName": "Sanyo Electric",
+      "region": "JP",
+      "notes": "Historic OEM supplier — acquired by Panasonic in 2009"
+    },
+    {
+      "name": "SONY",
+      "fullName": "Sony Energy Devices",
+      "region": "JP",
+      "notes": "Historic OEM supplier — battery division sold to Murata in 2017"
+    },
+    {
+      "name": "MURATA",
+      "fullName": "Murata Manufacturing",
+      "region": "JP",
+      "notes": "Acquired Sony Energy Devices battery division in 2017"
+    },
+    {
+      "name": "LGC",
+      "fullName": "LG Energy Solution (fmr. LG Chem)",
+      "region": "KR",
+      "notes": "Common modern OEM supplier — primary string reported by firmware"
+    },
+    {
+      "name": "LG",
+      "fullName": "LG Energy Solution",
+      "region": "KR",
+      "notes": "Alternate short form of LGC reported by some ThinkPad firmware versions"
+    },
+    {
+      "name": "SDI",
+      "fullName": "Samsung SDI",
+      "region": "KR",
+      "notes": "Samsung SDI battery division — primary string reported by firmware"
+    },
+    {
+      "name": "SAMSUNG",
+      "fullName": "Samsung SDI",
+      "region": "KR",
+      "notes": "Alternate form of SDI reported by some ThinkPad firmware versions"
+    },
+    {
+      "name": "CELXPERT",
+      "fullName": "Celxpert Energy Corporation",
+      "region": "TW",
+      "notes": "Confirmed Lenovo-authorized supplier — common in ThinkPad T and X series"
+    },
+    {
+      "name": "ATL",
+      "fullName": "Amperex Technology Limited",
+      "region": "CN",
+      "notes": "Major Lenovo OEM cell supplier"
+    },
+    {
+      "name": "COSMX",
+      "fullName": "CosMX Battery",
+      "region": "CN",
+      "notes": "Confirmed Lenovo-authorized supplier"
+    },
+    {
+      "name": "BYD",
+      "fullName": "BYD Company — Battery Division",
+      "region": "CN",
+      "notes": "Confirmed Lenovo-authorized supplier"
+    },
+    {
+      "name": "NVT",
+      "fullName": "NVT Energy",
+      "region": "CN",
+      "notes": "Confirmed Lenovo-authorized supplier"
+    },
+    {
+      "name": "SUNWODA",
+      "fullName": "Sunwoda Electronic",
+      "region": "CN",
+      "notes": "Confirmed Lenovo-authorized supplier — common in ThinkPad E series"
+    },
+    {
+      "name": "SMP",
+      "fullName": "Simplo Technology",
+      "region": "TW",
+      "notes": "Confirmed Lenovo-authorized supplier"
+    }
+  ]
+}
