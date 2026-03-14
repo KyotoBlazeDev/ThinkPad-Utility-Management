@@ -925,6 +925,79 @@ function LenovoEC {
         Write-Host "Lenovo_Odometer not accessible." -ForegroundColor Red
     }
 
+    # -- Battery Temperatures (Lenovo_Battery) -----------------------------------
+    # Lenovo_Battery exposes a Temperature property per battery pack.
+    # The raw value varies by firmware version and locale:
+    #   "28"    plain integer (most common)
+    #   "28.5"  decimal with period
+    #   "28,5"  decimal with locale comma
+    #   "28 C"  integer with unit suffix
+    #   "285"   tenths-of-a-degree encoding (divide by 10)
+    # Lenovo_Battery carries no timestamp - the value reflects
+    # whatever the EC last wrote to the WMI data block.
+    #
+    # Colour tiers:
+    #   <=40 C  Normal    White
+    #   41-50 C Warning   Yellow
+    #   51-60 C Elevated  Red
+    #   >60 C   Critical  Red
+    Write-Host ""
+    Write-Host "[ Battery Temperatures - Lenovo_Battery ]"
+    if (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Battery") {
+        try {
+            $lbBatteries = @(Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Battery -ErrorAction Stop)
+            if ($lbBatteries -and $lbBatteries.Count -gt 0) {
+                foreach ($lb in $lbBatteries) {
+                    $batteryID = Get-SafeWmiProperty -Object $lb -PropertyName "BatteryID"
+                    $tempRaw   = Get-SafeWmiProperty -Object $lb -PropertyName "Temperature"
+                    $label     = if ($batteryID -and $batteryID -ne "Unavailable") { $batteryID } else { "Battery" }
+
+                    Write-Host "  $label`: " -NoNewline
+
+                    $tempNum = $null
+                    if ($tempRaw -and $tempRaw -ne "Unavailable") {
+                        $tempStripped = (([string]$tempRaw) -replace '[^0-9,\.]','') -replace ',','.'
+                        [double]$parsed = 0
+                        if ($tempStripped -ne "" -and [double]::TryParse($tempStripped,
+                                [System.Globalization.NumberStyles]::Any,
+                                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                            if ($parsed -ge 200 -and ([string]$tempRaw) -notmatch '[Cc]') {
+                                $parsed = [math]::Round($parsed / 10, 1)
+                            }
+                            $tempNum = $parsed
+                        }
+                    }
+
+                    if ($null -ne $tempNum) {
+                        $tempColor = if     ($tempNum -gt 60) { "Red"    }
+                                     elseif ($tempNum -ge 51) { "Red"    }
+                                     elseif ($tempNum -ge 41) { "Yellow" }
+                                     else                     { "White"  }
+                        $tempLabel = if     ($tempNum -gt 60) { "  [!] CRITICAL - Exceeds safe limits" }
+                                     elseif ($tempNum -ge 51) { "  [!] ELEVATED - Thermal stress range (51-60 C)" }
+                                     elseif ($tempNum -ge 41) { "  [!] WARNING - High temperature (41-50 C)" }
+                                     else                     { "  Normal" }
+                        Write-Host "$tempNum C" -ForegroundColor $tempColor -NoNewline
+                        Write-Host $tempLabel -ForegroundColor $tempColor
+                    }
+                    else {
+                        Write-Host $tempRaw
+                    }
+                }
+            }
+            else {
+                Write-Host "  No batteries returned by Lenovo_Battery." -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Log-Error "root\Lenovo" "Lenovo_Battery" $_
+            Write-Host "  Lenovo_Battery not accessible." -ForegroundColor Red
+        }
+    }
+    else {
+        Write-Host "  Lenovo_Battery class not available." -ForegroundColor Yellow
+    }
+
     Read-Host "Press ENTER"
 }
 
@@ -1062,7 +1135,52 @@ function FullCharge {
                         Write-Host "[ Electrical ]"
                         Write-Host "  Voltage              : $(Get-SafeWmiProperty -Object $lb -PropertyName 'Voltage')"
                         Write-Host "  Wattage              : $(Get-SafeWmiProperty -Object $lb -PropertyName 'Wattage')"
-                        Write-Host "  Temperature          : $(Get-SafeWmiProperty -Object $lb -PropertyName 'Temperature')"
+
+                        # Temperature - the raw value from Lenovo_Battery varies by firmware
+                        # version and locale. Observed formats include:
+                        #   "28"    plain integer (most common)
+                        #   "28.5"  decimal with period
+                        #   "28,5"  decimal with locale comma
+                        #   "28 C"  integer with unit suffix
+                        #   "285"   tenths-of-a-degree encoding (divide by 10)
+                        # Lenovo_Battery carries no timestamp - the value reflects
+                        # whatever the EC last wrote to the WMI data block.
+                        #
+                        # Colour tiers:
+                        #   <=40 C  Normal    White
+                        #   41-50 C Warning   Yellow
+                        #   51-60 C Elevated  Red
+                        #   >60 C   Critical  Red
+                        $tempRaw = Get-SafeWmiProperty -Object $lb -PropertyName "Temperature"
+                        Write-Host "  Temperature          : " -NoNewline
+                        $tempNum = $null
+                        if ($tempRaw -and $tempRaw -ne "Unavailable") {
+                            $tempStripped = (([string]$tempRaw) -replace '[^0-9,\.]','') -replace ',','.'
+                            [double]$parsed = 0
+                            if ($tempStripped -ne "" -and [double]::TryParse($tempStripped,
+                                    [System.Globalization.NumberStyles]::Any,
+                                    [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                                if ($parsed -ge 200 -and ([string]$tempRaw) -notmatch '[Cc]') {
+                                    $parsed = [math]::Round($parsed / 10, 1)
+                                }
+                                $tempNum = $parsed
+                            }
+                        }
+                        if ($null -ne $tempNum) {
+                            $tempColor = if     ($tempNum -gt 60) { "Red"    }
+                                         elseif ($tempNum -ge 51) { "Red"    }
+                                         elseif ($tempNum -ge 41) { "Yellow" }
+                                         else                     { "White"  }
+                            $tempLabel = if     ($tempNum -gt 60) { "  [!] CRITICAL - Exceeds safe limits" }
+                                         elseif ($tempNum -ge 51) { "  [!] ELEVATED - Thermal stress range (51-60 C)" }
+                                         elseif ($tempNum -ge 41) { "  [!] WARNING - High temperature (41-50 C)" }
+                                         else                     { "  Normal" }
+                            Write-Host "$tempNum C" -ForegroundColor $tempColor -NoNewline
+                            Write-Host $tempLabel -ForegroundColor $tempColor
+                        }
+                        else {
+                            Write-Host $tempRaw
+                        }
                         Write-Host ""
 
                         # ── Classification ───────────────────────────────────
@@ -2829,28 +2947,56 @@ function Show-CdrtOdometer {
     } else {
         Write-Host "Unavailable" -ForegroundColor Yellow
     }
+    Write-Host ("-" * 50) -ForegroundColor DarkGray
 
     # Shock Events
     # The CDRT accelerometer threshold is sensitive — counts include minor bumps,
-    # vibrations, and bag movement, not just actual drops. Thresholds are set
-    # accordingly: counts in the hundreds are normal for a well-travelled machine.
+    # vibrations, and bag movement, not just actual drops.
+    # Realistic lifetime ranges for ThinkPads:
+    #   Mostly desk use     :   500 -  3,000
+    #   Normal portable use :  5,000 - 20,000
+    #   Heavy travel        : 20,000 - 60,000
+    # Thresholds:
+    #   0-20,000   Green  - Normal (desk to regular portable use)
+    #   20,001-60,000 Yellow - Heavy travel, worth noting
+    #   60,000+    Red    - Unusually high, inspect for damage history
     Write-Host "Shock Events           : " -NoNewline
     if ($null -ne $cdrt.ShockEvents) {
-        $shockColor = if ($cdrt.ShockEvents -lt 100) { "Green" } elseif ($cdrt.ShockEvents -lt 1000) { "Yellow" } else { "Red" }
-        Write-Host $cdrt.ShockEvents -ForegroundColor $shockColor
+        $shockColor = if     ($cdrt.ShockEvents -le 20000) { "Green"  }
+                      elseif ($cdrt.ShockEvents -le 60000) { "Yellow" }
+                      else                                  { "Red"    }
+        $shockLabel = if     ($cdrt.ShockEvents -le 20000) { "Normal" }
+                      elseif ($cdrt.ShockEvents -le 60000) { "Heavy travel range" }
+                      else                                  { "Unusually high - inspect for damage history" }
+        Write-Host "$($cdrt.ShockEvents)  ($shockLabel)" -ForegroundColor $shockColor
         Write-Host "  Note: Counts accelerometer events above the CDRT vibration threshold." -ForegroundColor DarkGray
         Write-Host "        Includes minor bumps and movement — not only actual drops." -ForegroundColor DarkGray
     } else {
         Write-Host "Unavailable" -ForegroundColor Yellow
     }
+    Write-Host ("-" * 50) -ForegroundColor DarkGray
 
     # Thermal Events
+    # Thresholds are calibrated to lifetime count, not to zero-tolerance:
+    #   0-50   Green  - Normal across any lifespan
+    #   51-200 Yellow - Moderate, worth monitoring
+    #   200+   Red    - Frequent throttling, investigate cooling
     Write-Host "Thermal Events         : " -NoNewline
     if ($null -ne $cdrt.ThermalEvents) {
-        $thermalColor = if ($cdrt.ThermalEvents -eq 0) { "Green" } elseif ($cdrt.ThermalEvents -lt 10) { "Yellow" } else { "Red" }
-        Write-Host $cdrt.ThermalEvents -ForegroundColor $thermalColor
-        if ($cdrt.ThermalEvents -gt 0) {
-            Write-Host "  Note: Each event represents a CPU throttle due to critical temperature." -ForegroundColor DarkGray
+        $thermalColor = if     ($cdrt.ThermalEvents -le 50)  { "Green"  }
+                        elseif ($cdrt.ThermalEvents -le 200) { "Yellow" }
+                        else                                  { "Red"    }
+        $thermalLabel = if     ($cdrt.ThermalEvents -le 50)  { "Normal" }
+                        elseif ($cdrt.ThermalEvents -le 200) { "Moderate - monitor cooling" }
+                        else                                  { "Frequent throttling - investigate cooling" }
+        Write-Host "$($cdrt.ThermalEvents)  ($thermalLabel)" -ForegroundColor $thermalColor
+        Write-Host "  Note: Each event represents a CPU throttle due to critical temperature." -ForegroundColor DarkGray
+        if ($null -ne $cdrt.CpuUptimeMinutes -and $cdrt.CpuUptimeMinutes -gt 0) {
+            $uptimeYears = $cdrt.CpuUptimeMinutes / 525600
+            if ($uptimeYears -gt 0) {
+                $ratePerYear = [math]::Round($cdrt.ThermalEvents / $uptimeYears, 1)
+                Write-Host "  Rate   : ~$ratePerYear events/year over $([math]::Round($uptimeYears, 1)) years of CPU uptime" -ForegroundColor DarkGray
+            }
         }
     } else {
         Write-Host "Unavailable" -ForegroundColor Yellow
@@ -3126,6 +3272,327 @@ function Show-ErrorLog {
     Read-Host "Press ENTER"
 }
 
+
+function Get-ThinkPadHealthScore {
+    <#
+    .SYNOPSIS
+    Computes a single 0-100 health score for this ThinkPad by aggregating
+    battery health, cycle count, shock events, thermal events, and memory
+    configuration into weighted component scores.
+
+    .DESCRIPTION
+    Component weights (must sum to 100):
+      Battery Health %  50 pts  -- primary wear indicator
+      Cycle Count       20 pts  -- corroborates battery age
+      Shock Events      15 pts  -- physical abuse history (CDRT, optional)
+      Thermal Events    10 pts  -- sustained overheating history (CDRT, optional)
+      Memory Mismatch    5 pts  -- configuration defect
+
+    When CDRT data is unavailable the 25 pts allocated to shock and thermal
+    are redistributed: 15 to battery health and 10 to cycle count, keeping
+    the total at 100 and the score meaningful on systems without Commercial
+    Vantage.
+
+    Returns a PSCustomObject with:
+      Score           - Integer 0-100
+      Grade           - Excellent / Good / Fair / Poor / Critical
+      GradeColor      - PowerShell console colour string
+      Components      - Hashtable of per-component scores and notes
+      CdrtAvailable   - Whether CDRT data contributed to the score
+      DataSources     - Array of human-readable source descriptions used
+    #>
+
+    $score      = 0
+    $components = [ordered]@{}
+    $sources    = @()
+    $cdrtAvail  = $false
+
+    # ── Component 1: Battery Health % ───────────────────────────────────────
+    # Try Lenovo_Battery first, fall back to ACPI BatteryFullChargedCapacity.
+    # Weight: 50 pts normally; 65 pts when CDRT unavailable.
+    $batteryPct   = $null
+    $batteryNotes = "No battery data found"
+
+    if ((Test-LenovoNamespace) -and (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Battery")) {
+        try {
+            $lbBatteries = @(Get-CimInstance -CimSession $script:CimSession `
+                -Namespace root\Lenovo -ClassName Lenovo_Battery -ErrorAction Stop)
+            if ($lbBatteries -and $lbBatteries.Count -gt 0) {
+                $healths = @()
+                foreach ($lb in $lbBatteries) {
+                    $dcStr = ((Get-SafeWmiProperty -Object $lb -PropertyName "DesignCapacity") `
+                        -replace '[^0-9,\.]','') -replace ',','.'
+                    $fcStr = ((Get-SafeWmiProperty -Object $lb -PropertyName "FullChargeCapacity") `
+                        -replace '[^0-9,\.]','') -replace ',','.'
+                    [double]$dc = 0; [double]$fc = 0
+                    if ([double]::TryParse($dcStr, [System.Globalization.NumberStyles]::Any,
+                            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dc) -and
+                        [double]::TryParse($fcStr, [System.Globalization.NumberStyles]::Any,
+                            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$fc) -and
+                        $dc -gt 0) {
+                        $healths += [math]::Round(($fc / $dc) * 100, 1)
+                    }
+                }
+                if ($healths.Count -gt 0) {
+                    # Use worst battery — a chain is only as strong as its weakest link
+                    $batteryPct   = ($healths | Measure-Object -Minimum).Minimum
+                    $batteryNotes = "Worst battery: $batteryPct% (Lenovo_Battery)"
+                    $sources     += "Lenovo_Battery (root\Lenovo)"
+                }
+            }
+        } catch {}
+    }
+
+    if ($null -eq $batteryPct) {
+        try {
+            $acpiBats = @(Get-WmiObject -Namespace root\wmi `
+                -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+            if ($acpiBats -and $acpiBats.Count -gt 0) {
+                $healths = @()
+                for ($i = 0; $i -lt $acpiBats.Count; $i++) {
+                    $fc  = $acpiBats[$i].FullChargedCapacity
+                    $dcV = Get-DesignCapacity -Index $i
+                    [int64]$fcN = 0; [int64]$dcN = 0
+                    if ($fc -and $dcV -and
+                        [int64]::TryParse($fc.ToString(),  [ref]$fcN) -and
+                        [int64]::TryParse($dcV.ToString(), [ref]$dcN) -and
+                        $dcN -gt 0) {
+                        $healths += [math]::Round(($fcN / $dcN) * 100, 1)
+                    }
+                }
+                if ($healths.Count -gt 0) {
+                    $batteryPct   = ($healths | Measure-Object -Minimum).Minimum
+                    $batteryNotes = "Worst battery: $batteryPct% (ACPI)"
+                    $sources     += "BatteryFullChargedCapacity (root\wmi)"
+                }
+            }
+        } catch {}
+    }
+
+    # ── Component 2: Cycle Count ─────────────────────────────────────────────
+    # Source: Lenovo_Odometer.Battery_cycles.
+    # Weight: 20 pts normally; 30 pts when CDRT unavailable.
+    # Typical ThinkPad battery is rated 300-500 cycles; 80% health often
+    # reached around 300. We score linearly: 0 cycles = full marks, 500+ = 0.
+    $cycleCount  = $null
+    $cycleNotes  = "Cycle count unavailable"
+
+    if (Test-LenovoNamespace) {
+        try {
+            $odo = Get-CimInstance -CimSession $script:CimSession `
+                -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
+            [int64]$parsed = 0
+            if ([int64]::TryParse(([string]$odo.Battery_cycles -replace '\D',''), [ref]$parsed)) {
+                $cycleCount  = $parsed
+                $cycleNotes  = "$cycleCount cycles"
+                $sources    += "Lenovo_Odometer (root\Lenovo)"
+            }
+        } catch {}
+    }
+
+    # ── Component 3 & 4: CDRT Shock and Thermal Events ──────────────────────
+    $cdrt = Get-CdrtOdometerData
+    if ($cdrt.Available) {
+        $cdrtAvail = $true
+        $sources  += "CDRT Odometer via Lenovo_Odometer"
+    }
+
+    # ── Calculate component scores ───────────────────────────────────────────
+    # Redistribute weights when CDRT is absent.
+    $wBattery = if ($cdrtAvail) { 50 } else { 65 }
+    $wCycle   = if ($cdrtAvail) { 20 } else { 30 }
+    $wShock   = if ($cdrtAvail) { 15 } else {  0 }
+    $wThermal = if ($cdrtAvail) { 10 } else {  0 }
+    $wMemory  = 5
+
+    # Battery component (0–wBattery pts)
+    $batteryScore = 0
+    if ($null -ne $batteryPct) {
+        # Direct linear mapping: health% maps to full weight
+        $batteryScore = [math]::Round(($batteryPct / 100) * $wBattery, 1)
+    }
+    else {
+        # No data — assume neutral (70%) rather than penalising unfairly
+        $batteryScore  = [math]::Round(0.70 * $wBattery, 1)
+        $batteryNotes  = "No battery data - assumed neutral"
+    }
+    $components["Battery Health"] = [PSCustomObject]@{
+        Score   = $batteryScore
+        MaxScore = $wBattery
+        Note    = $batteryNotes
+    }
+
+    # Cycle component (0–wCycle pts)
+    # 0 cycles = full marks; 500 cycles = 0 pts; linear between.
+    $cycleScore = 0
+    if ($null -ne $cycleCount) {
+        $cycleFraction = [math]::Max(0, (500 - $cycleCount) / 500)
+        $cycleScore    = [math]::Round($cycleFraction * $wCycle, 1)
+    }
+    else {
+        $cycleScore = [math]::Round(0.70 * $wCycle, 1)
+        $cycleNotes = "Cycle count unavailable - assumed neutral"
+    }
+    $components["Cycle Count"] = [PSCustomObject]@{
+        Score    = $cycleScore
+        MaxScore = $wCycle
+        Note     = $cycleNotes
+    }
+
+    # Shock component (0–wShock pts) — only when CDRT available
+    $shockScore = 0
+    $shockNotes = "CDRT not available"
+    if ($cdrtAvail -and $null -ne $cdrt.ShockEvents) {
+        # 0-20,000 = full marks; 20,001-60,000 = linear decay to 50%;
+        # 60,000+ = linear decay from 50% to 0 at 120,000
+        $s = $cdrt.ShockEvents
+        $shockFraction = if     ($s -le 20000) { 1.0 }
+                         elseif ($s -le 60000) { 1.0 - (($s - 20000) / 80000) }
+                         else                  { [math]::Max(0, 1.0 - (($s - 20000) / 100000)) }
+        $shockScore = [math]::Round($shockFraction * $wShock, 1)
+        $shockNotes = "$($cdrt.ShockEvents) shock events"
+    }
+    elseif ($cdrtAvail) {
+        $shockNotes = "Shock events field not found in CDRT"
+    }
+    if ($wShock -gt 0) {
+        $components["Shock Events"] = [PSCustomObject]@{
+            Score    = $shockScore
+            MaxScore = $wShock
+            Note     = $shockNotes
+        }
+    }
+
+    # Thermal component (0–wThermal pts) — only when CDRT available
+    $thermalScore = 0
+    $thermalNotes = "CDRT not available"
+    if ($cdrtAvail -and $null -ne $cdrt.ThermalEvents) {
+        # 0-50 = full marks; 51-200 = linear decay to 50%; 200+ = decay to 0 at 400
+        $t = $cdrt.ThermalEvents
+        $thermalFraction = if     ($t -le 50)  { 1.0 }
+                           elseif ($t -le 200) { 1.0 - (($t - 50) / 300) }
+                           else                { [math]::Max(0, 1.0 - (($t - 50) / 700)) }
+        $thermalScore = [math]::Round($thermalFraction * $wThermal, 1)
+        $thermalNotes = "$($cdrt.ThermalEvents) thermal throttle events"
+    }
+    elseif ($cdrtAvail) {
+        $thermalNotes = "Thermal events field not found in CDRT"
+    }
+    if ($wThermal -gt 0) {
+        $components["Thermal Events"] = [PSCustomObject]@{
+            Score    = $thermalScore
+            MaxScore = $wThermal
+            Note     = $thermalNotes
+        }
+    }
+
+    # Memory component (0–5 pts)
+    $memScore = 0
+    $memNotes = "Memory data unavailable"
+    try {
+        $memState = Get-MemoryState
+        if ($memState.ModuleCount -gt 0) {
+            $sources += "Win32_PhysicalMemory"
+            if ($memState.SpeedMismatch) {
+                $memScore = 0
+                $memNotes = "Speed mismatch detected ($($memState.ModuleCount) modules)"
+            }
+            else {
+                $memScore = $wMemory
+                $memNotes = "$($memState.ModuleCount) module(s) matched"
+            }
+        }
+        else {
+            # Single soldered module or unreadable — give full marks, no penalty
+            $memScore = $wMemory
+            $memNotes = "Single/soldered module or unreadable - no penalty"
+        }
+    } catch {}
+    $components["Memory"] = [PSCustomObject]@{
+        Score    = $memScore
+        MaxScore = $wMemory
+        Note     = $memNotes
+    }
+
+    # ── Total ────────────────────────────────────────────────────────────────
+    $total = [math]::Round($batteryScore + $cycleScore + $shockScore + $thermalScore + $memScore)
+    $total = [math]::Max(0, [math]::Min(100, $total))
+
+    $grade      = if     ($total -ge 85) { "Excellent" }
+                  elseif ($total -ge 70) { "Good"      }
+                  elseif ($total -ge 55) { "Fair"      }
+                  elseif ($total -ge 35) { "Poor"      }
+                  else                   { "Critical"  }
+
+    $gradeColor = if     ($total -ge 85) { "Green"   }
+                  elseif ($total -ge 70) { "Cyan"    }
+                  elseif ($total -ge 55) { "Yellow"  }
+                  elseif ($total -ge 35) { "Magenta" }
+                  else                   { "Red"     }
+
+    return [PSCustomObject]@{
+        Score         = $total
+        Grade         = $grade
+        GradeColor    = $gradeColor
+        Components    = $components
+        CdrtAvailable = $cdrtAvail
+        DataSources   = $sources
+    }
+}
+
+function Show-ThinkPadHealthScore {
+    Show-Header
+    Write-Host "[ ThinkPad Health Score ]"
+    Write-Host ""
+    Write-Host "Calculating..." -ForegroundColor Cyan
+    Write-Host ""
+
+    $hs = Get-ThinkPadHealthScore
+
+    # ── Score banner ─────────────────────────────────────────────────────────
+    Write-Host ("=" * 50)
+    Write-Host "  Health Score : " -NoNewline
+    Write-Host "$($hs.Score) / 100" -ForegroundColor $hs.GradeColor -NoNewline
+    Write-Host "   [$($hs.Grade)]" -ForegroundColor $hs.GradeColor
+    Write-Host ("=" * 50)
+    Write-Host ""
+
+    # ── Component breakdown ──────────────────────────────────────────────────
+    Write-Host "[ Component Breakdown ]"
+    Write-Host ("-" * 50) -ForegroundColor DarkGray
+    foreach ($key in $hs.Components.Keys) {
+        $c         = $hs.Components[$key]
+        $pct       = if ($c.MaxScore -gt 0) { [math]::Round(($c.Score / $c.MaxScore) * 100) } else { 0 }
+        $compColor = if     ($pct -ge 85) { "Green"   }
+                     elseif ($pct -ge 70) { "Cyan"    }
+                     elseif ($pct -ge 55) { "Yellow"  }
+                     elseif ($pct -ge 35) { "Magenta" }
+                     else                 { "Red"     }
+        $label     = "$key".PadRight(20)
+        Write-Host "  $label : " -NoNewline
+        Write-Host "$($c.Score) / $($c.MaxScore) pts" -ForegroundColor $compColor -NoNewline
+        Write-Host "   $($c.Note)" -ForegroundColor DarkGray
+    }
+    Write-Host ("-" * 50) -ForegroundColor DarkGray
+    Write-Host ""
+
+    # ── CDRT notice if absent ────────────────────────────────────────────────
+    if (-not $hs.CdrtAvailable) {
+        Write-Host "Note: Shock and thermal event data unavailable (CDRT/Commercial Vantage" -ForegroundColor DarkGray
+        Write-Host "      not deployed). Their weight was redistributed to battery and cycle." -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # ── Data sources ─────────────────────────────────────────────────────────
+    Write-Host "[ Data Sources ]" -ForegroundColor DarkGray
+    foreach ($src in $hs.DataSources) {
+        Write-Host "  - $src" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+
+    Read-Host "Press ENTER"
+}
+
 do {
     Show-Header
 
@@ -3156,7 +3623,8 @@ do {
     Write-Host "11. CDRT Odometer"
     Write-Host "12. About"
     Write-Host "13. Error Log Viewer"
-    Write-Host "14. Exit"
+    Write-Host "14. ThinkPad Health Score"
+    Write-Host "15. Exit"
     Write-Host ""
 
     $choice = Read-Host "Select option"
@@ -3175,9 +3643,10 @@ do {
         "11" { Show-CdrtOdometer }
         "12" { Show-About }
         "13" { Show-ErrorLog }
+        "14" { Show-ThinkPadHealthScore }
     }
 
-} while ($choice -ne "14")
+} while ($choice -ne "15")
 
 # Tear down the shared CIM session cleanly before exiting.
 if ($script:CimSession) {
