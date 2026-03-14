@@ -1,4 +1,4 @@
-﻿Clear-Host
+Clear-Host
 
 # ── Administrator privilege check with auto-elevation ────────────────────
 # The root\wmi and root\Lenovo WMI namespaces communicate directly with the
@@ -3593,6 +3593,225 @@ function Show-ThinkPadHealthScore {
     Read-Host "Press ENTER"
 }
 
+
+function Get-BiosUpdateInfo {
+    <#
+    .SYNOPSIS
+    Checks whether a newer BIOS version is available for this device by
+    querying Lenovo's public per-MTM XML catalog.
+
+    .DESCRIPTION
+    Lenovo publishes a machine-readable update catalog at:
+        https://download.lenovo.com/catalog/<MTM>_Win<10|11>.xml
+
+    The MTM (Machine Type) is the first four characters of the model number
+    from Win32_ComputerSystemProduct.Name (e.g. '20X8' from '20X8S06P00').
+
+    The catalog lists all available packages for the device. This function
+    finds the BIOS package entry, follows its location URL to retrieve the
+    exact version string and release date, then compares against the
+    currently installed BIOS version from Win32_BIOS.SMBIOSBIOSVersion.
+
+    Returns a PSCustomObject with:
+      InstalledVersion  - Version string from Win32_BIOS
+      InstalledDate     - BIOS release date from Win32_BIOS
+      LatestVersion     - Latest version from Lenovo catalog
+      LatestDate        - Release date of the latest version
+      IsUpToDate        - $true if installed >= latest
+      UpdateAvailable   - $true if a newer version exists
+      MTM               - Four-character machine type used for the lookup
+      CatalogUrl        - The catalog URL that was queried
+      Available         - $false if the check could not be completed
+      UnavailableReason - Populated when Available is $false
+    #>
+
+    $result = [PSCustomObject]@{
+        InstalledVersion  = "Unknown"
+        InstalledDate     = "Unknown"
+        LatestVersion     = "Unknown"
+        LatestDate        = "Unknown"
+        IsUpToDate        = $false
+        UpdateAvailable   = $false
+        MTM               = "Unknown"
+        CatalogUrl        = ""
+        Available         = $false
+        UnavailableReason = ""
+    }
+
+    # ── Installed BIOS from cached system info ───────────────────────────────
+    $si = Get-SystemInfo
+    $result.InstalledVersion = $si.BIOSVersion
+    $result.InstalledDate    = $si.BIOSDate
+
+    # ── Extract MTM from Win32_ComputerSystemProduct.Name ────────────────────
+    # Name returns the full model number e.g. '20X8S06P00'.
+    # The catalog uses only the first four characters: '20X8'.
+    try {
+        $csp = Get-CimInstance -CimSession $script:CimSession `
+            -ClassName Win32_ComputerSystemProduct -ErrorAction Stop
+        if ($csp -and $csp.Name -and $csp.Name.Length -ge 4) {
+            $result.MTM = $csp.Name.Substring(0, 4).ToUpper()
+        }
+        else {
+            $result.UnavailableReason = "Could not read model number from Win32_ComputerSystemProduct."
+            return $result
+        }
+    }
+    catch {
+        $result.UnavailableReason = "Win32_ComputerSystemProduct query failed: $($_.Exception.Message)"
+        return $result
+    }
+
+    # ── Detect Windows version for catalog URL suffix ────────────────────────
+    $winSuffix = "Win10"
+    try {
+        $os = Get-CimInstance -CimSession $script:CimSession `
+            -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+        if ($os -and $os.Version -match "^10\.0\.2") {
+            # Build 20000+ = Windows 11
+            $winSuffix = "Win11"
+        }
+    }
+    catch {}
+
+    # ── Fetch catalog XML ─────────────────────────────────────────────────────
+    $catalogUrl = "https://download.lenovo.com/catalog/$($result.MTM)_$winSuffix.xml"
+    $result.CatalogUrl = $catalogUrl
+
+    try {
+        $response = Invoke-WebRequest -Uri $catalogUrl -UseBasicParsing `
+            -TimeoutSec 15 -ErrorAction Stop
+        # Decode raw bytes as UTF-8 explicitly -- Invoke-WebRequest may
+        # misdetect encoding and return the UTF-8 BOM as garbage characters.
+        # [System.Text.Encoding]::UTF8.GetString strips the BOM correctly.
+        $catalogContent = [System.Text.Encoding]::UTF8.GetString($response.RawContent[($response.RawContent.IndexOf([byte]0x3C))..($response.RawContent.Length - 1)])
+        [xml]$catalog = $catalogContent
+    }
+    catch {
+        $result.UnavailableReason = "Failed to fetch catalog ($catalogUrl): $($_.Exception.Message)"
+        return $result
+    }
+
+    # ── Find BIOS package in catalog ──────────────────────────────────────────
+    # The category value in Lenovo's catalog is 'BIOS UEFI', not 'BIOS'.
+    # We match on 'BIOS' as a substring to handle any future variation.
+    $biosPackage = $null
+    foreach ($pkg in $catalog.packages.package) {
+        if ($pkg.Category -match 'BIOS') {
+            $biosPackage = $pkg
+            break
+        }
+    }
+
+    if (-not $biosPackage) {
+        $result.UnavailableReason = "No BIOS package found in catalog for MTM $($result.MTM)."
+        return $result
+    }
+
+    # ── Fetch BIOS package descriptor for version and date ───────────────────
+    # The catalog <location> element points to a per-package XML with full details.
+    $pkgUrl = $biosPackage.location
+    if (-not $pkgUrl) {
+        $result.UnavailableReason = "BIOS package entry has no location URL."
+        return $result
+    }
+
+    try {
+        $pkgResponse = Invoke-WebRequest -Uri $pkgUrl -UseBasicParsing `
+            -TimeoutSec 15 -ErrorAction Stop
+        # Same UTF-8 BOM workaround as the catalog fetch above.
+        $pkgContent = [System.Text.Encoding]::UTF8.GetString($pkgResponse.RawContent[($pkgResponse.RawContent.IndexOf([byte]0x3C))..($pkgResponse.RawContent.Length - 1)])
+        [xml]$pkgXml = $pkgContent
+    }
+    catch {
+        $result.UnavailableReason = "Failed to fetch BIOS package descriptor ($pkgUrl): $($_.Exception.Message)"
+        return $result
+    }
+
+    # Extract version and date from package descriptor
+    $latestVersion = $pkgXml.Package.version
+    $latestDate    = $pkgXml.Package.ReleaseDate
+
+    if (-not $latestVersion) {
+        $result.UnavailableReason = "BIOS package descriptor did not contain a version string."
+        return $result
+    }
+
+    $result.LatestVersion = $latestVersion.Trim()
+    $result.LatestDate    = if ($latestDate) { $latestDate.Trim() } else { "Unknown" }
+    $result.Available     = $true
+
+    # ── Compare versions ──────────────────────────────────────────────────────
+    # BIOS version strings are model-specific (e.g. 'R1KET49W', 'N3HET56W').
+    # Direct string comparison is reliable when the format is consistent.
+    # We normalise both to uppercase and trim whitespace before comparing.
+    $installed = $result.InstalledVersion.Trim().ToUpper()
+    $latest    = $result.LatestVersion.Trim().ToUpper()
+
+    if ($installed -eq $latest) {
+        $result.IsUpToDate      = $true
+        $result.UpdateAvailable = $false
+    }
+    else {
+        $result.IsUpToDate      = $false
+        $result.UpdateAvailable = $true
+    }
+
+    return $result
+}
+
+function Show-BiosUpdateCheck {
+    Show-Header
+    Write-Host "[ BIOS Update Check ]"
+    Write-Host ""
+    Write-Host "Querying Lenovo update catalog..." -ForegroundColor Cyan
+    Write-Host ""
+
+    $bios = Get-BiosUpdateInfo
+
+    Write-Host "[ Installed ]"
+    Write-Host "  Version      : $($bios.InstalledVersion)"
+    Write-Host "  Release Date : $($bios.InstalledDate)"
+    Write-Host ""
+
+    if (-not $bios.Available) {
+        Write-Host "[ Latest ]"
+        Write-Host "  Could not retrieve catalog data." -ForegroundColor Yellow
+        Write-Host "  Reason: $($bios.UnavailableReason)" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Ensure the system has internet access and try again." -ForegroundColor DarkGray
+        Write-Host "  Or check manually: support.lenovo.com -> Drivers & Software" -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "[ Latest - Lenovo Catalog ]"
+        Write-Host "  Version      : $($bios.LatestVersion)"
+        Write-Host "  Release Date : $($bios.LatestDate)"
+        Write-Host "  MTM          : $($bios.MTM)" -ForegroundColor DarkGray
+        Write-Host "  Catalog      : $($bios.CatalogUrl)" -ForegroundColor DarkGray
+        Write-Host ""
+
+        Write-Host "[ Status ]"
+        if ($bios.IsUpToDate) {
+            Write-Host "  Up to date." -ForegroundColor Green
+        }
+        else {
+            Write-Host "  Update available." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  Installed : $($bios.InstalledVersion)" -ForegroundColor DarkGray
+            Write-Host "  Available : $($bios.LatestVersion)" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  Download from: support.lenovo.com -> Drivers & Software" -ForegroundColor Cyan
+            Write-Host "  Search for your model and filter by BIOS/UEFI." -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Note: Version comparison is string-based. If the format differs" -ForegroundColor DarkGray
+    Write-Host "      between installed and catalog, check the dates manually." -ForegroundColor DarkGray
+    Write-Host ""
+    Read-Host "Press ENTER"
+}
+
 do {
     Show-Header
 
@@ -3624,7 +3843,8 @@ do {
     Write-Host "12. About"
     Write-Host "13. Error Log Viewer"
     Write-Host "14. ThinkPad Health Score"
-    Write-Host "15. Exit"
+    Write-Host "15. BIOS Update Check"
+    Write-Host "16. Exit"
     Write-Host ""
 
     $choice = Read-Host "Select option"
@@ -3644,9 +3864,10 @@ do {
         "12" { Show-About }
         "13" { Show-ErrorLog }
         "14" { Show-ThinkPadHealthScore }
+        "15" { Show-BiosUpdateCheck }
     }
 
-} while ($choice -ne "15")
+} while ($choice -ne "16")
 
 # Tear down the shared CIM session cleanly before exiting.
 if ($script:CimSession) {
