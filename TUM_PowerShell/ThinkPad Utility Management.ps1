@@ -72,7 +72,8 @@ $script:ErrorLog    = @()
 $script:SystemInfo  = $null
 $script:CimSession  = $null   # Shared CIM session — initialised after Show-Disclaimer
 $script:BatteryAlert = $null  # Cached battery alert state — populated by Get-BatteryAlertState
-
+$script:MenuLoopCount = 0     # Counts menu iterations — used to trigger guided battery analysis
+$script:GuidedAnalysisShown = $false  # Ensures auto-prompt fires only once per session
 
 function New-ScriptCimSession {
     <#
@@ -712,7 +713,11 @@ function Show-Header {
             } else {
                 "Battery $($b.Index)"
             }
-            Write-Host "$label`: $($b.Classification) ($($b.HealthPercent)%)" -ForegroundColor $bColor -NoNewline
+            $bEmoji = switch ($b.Severity) {
+                0 { "✔" }; 1 { "⚠" }; 2 { "⚠" }; 3 { "✖" }; 4 { "✖" }
+                default { "" }
+            }
+            Write-Host "$bEmoji $label`: $($b.Classification) ($($b.HealthPercent)%)" -ForegroundColor $bColor -NoNewline
             if ($i -lt $tokens.Count - 1) { Write-Host "  |  " -NoNewline }
         }
         # Append action hint if any battery needs attention
@@ -727,6 +732,39 @@ function Show-Header {
         Write-Host "Errors : " -NoNewline
         Write-Host "$($script:ErrorLog.Count) error(s) logged this session  [Option 13 to view]" -ForegroundColor Red
     }
+
+    # ── Prominent top-line warning banner (#1) ───────────────────────────
+    # Displayed on every screen whenever any battery has Severity >= 1
+    # (i.e. health below 80%) or is flagged as non-genuine.
+    # Uses a full-width bordered block to ensure it cannot be overlooked,
+    # even by users who open the script for an unrelated reason.
+    if ($script:BatteryAlert -and $script:BatteryAlert.Available -and $script:BatteryAlert.WorstSeverity -ge 1) {
+        $bannerColor = switch ($script:BatteryAlert.WorstSeverity) {
+            1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
+            default { "Yellow" }
+        }
+        $bannerIcon = switch ($script:BatteryAlert.WorstSeverity) {
+            1 { "⚠" }; 2 { "⚠" }; 3 { "✖" }; 4 { "✖" }
+            default { "⚠" }
+        }
+        $bannerLabel = switch ($script:BatteryAlert.WorstSeverity) {
+            1 { "BATTERY ATTENTION RECOMMENDED" }
+            2 { "BATTERY HEALTH FAIR — MONITOR CLOSELY" }
+            3 { "BATTERY HEALTH POOR — REPLACEMENT ADVISED" }
+            4 { "BATTERY CRITICAL — REPLACE IMMEDIATELY" }
+            default { "BATTERY ALERT" }
+        }
+        Write-Host "-----------------------------------------------" -ForegroundColor $bannerColor
+        Write-Host "  $bannerIcon  $bannerLabel  $bannerIcon" -ForegroundColor $bannerColor
+        foreach ($b in $script:BatteryAlert.Batteries) {
+            if ($b.Severity -ge 1) {
+                $bLabel = if ($b.BatteryID -and $b.BatteryID -ne "Unavailable") { $b.BatteryID } else { "Battery $($b.Index)" }
+                Write-Host "     $bLabel`: $($b.Classification) — $($b.HealthPercent)%  [Select Option 5 for full analysis]" -ForegroundColor $bannerColor
+            }
+        }
+        Write-Host "-----------------------------------------------" -ForegroundColor $bannerColor
+    }
+
     Write-Host ""
 }
 
@@ -3742,19 +3780,66 @@ function Get-BiosUpdateInfo {
     $result.Available     = $true
 
     # ── Compare versions ──────────────────────────────────────────────────────
-    # BIOS version strings are model-specific (e.g. 'R1KET49W', 'N3HET56W').
-    # Direct string comparison is reliable when the format is consistent.
-    # We normalise both to uppercase and trim whitespace before comparing.
-    $installed = $result.InstalledVersion.Trim().ToUpper()
-    $latest    = $result.LatestVersion.Trim().ToUpper()
+    # Win32_BIOS.SMBIOSBIOSVersion returns a string like 'R1KET50W (1.35 )'.
+    # The catalog returns only the numeric part e.g. '1.35'.
+    # Direct string comparison always fails because the formats differ.
+    #
+    # Strategy: extract the numeric version from both sides.
+    #   Installed: pull the decimal number from inside parentheses if present,
+    #              otherwise fall back to any decimal number in the string.
+    #   Catalog:   already a plain decimal string, just trim it.
+    # Compare as [version] objects so 1.10 > 1.9 correctly.
+    # If either side cannot be parsed as a version, fall back to string compare.
 
-    if ($installed -eq $latest) {
-        $result.IsUpToDate      = $true
-        $result.UpdateAvailable = $false
+    $installedRaw = $result.InstalledVersion.Trim()
+    $latestRaw    = $result.LatestVersion.Trim()
+
+    # Extract numeric version from installed string
+    # Try parentheses first: 'R1KET50W (1.35 )' -> '1.35'
+    $installedNumeric = $null
+    if ($installedRaw -match '\(([\d\.]+)') {
+        $installedNumeric = $matches[1].Trim()
     }
-    else {
-        $result.IsUpToDate      = $false
-        $result.UpdateAvailable = $true
+    elseif ($installedRaw -match '([\d]+\.[\d]+)') {
+        # Fallback: any decimal number in the string
+        $installedNumeric = $matches[1].Trim()
+    }
+
+    # Extract numeric version from catalog string (usually already clean)
+    $latestNumeric = $null
+    if ($latestRaw -match '([\d]+\.[\d]+)') {
+        $latestNumeric = $matches[1].Trim()
+    }
+
+    # Attempt [version] comparison
+    $compared = $false
+    if ($installedNumeric -and $latestNumeric) {
+        try {
+            $vInstalled = [version]$installedNumeric
+            $vLatest    = [version]$latestNumeric
+            if ($vInstalled -ge $vLatest) {
+                $result.IsUpToDate      = $true
+                $result.UpdateAvailable = $false
+            }
+            else {
+                $result.IsUpToDate      = $false
+                $result.UpdateAvailable = $true
+            }
+            $compared = $true
+        }
+        catch {}
+    }
+
+    # Fallback: plain string compare (catches identical strings)
+    if (-not $compared) {
+        if ($installedRaw.ToUpper() -eq $latestRaw.ToUpper()) {
+            $result.IsUpToDate      = $true
+            $result.UpdateAvailable = $false
+        }
+        else {
+            $result.IsUpToDate      = $false
+            $result.UpdateAvailable = $true
+        }
     }
 
     return $result
@@ -3814,6 +3899,36 @@ function Show-BiosUpdateCheck {
 
 do {
     Show-Header
+
+    # ── Guided-mode auto-prompt (#3) ─────────────────────────────────────
+    # After the user has browsed the menu 2 times without selecting a battery
+    # option, and any battery is degraded (Severity >= 1), gently surface the
+    # Comprehensive Battery Analysis once. Fires only once per session so it
+    # never becomes intrusive to power users.
+    $script:MenuLoopCount++
+    if (-not $script:GuidedAnalysisShown -and
+        $script:MenuLoopCount -ge 2 -and
+        $script:BatteryAlert -and
+        $script:BatteryAlert.Available -and
+        $script:BatteryAlert.WorstSeverity -ge 1) {
+
+        $script:GuidedAnalysisShown = $true
+        $guideColor = switch ($script:BatteryAlert.WorstSeverity) {
+            1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
+            default { "Yellow" }
+        }
+        Write-Host "-----------------------------------------------" -ForegroundColor $guideColor
+        Write-Host "  Battery concern detected. Would you like to run" -ForegroundColor $guideColor
+        Write-Host "  Option 5 (Comprehensive Battery Analysis) now?" -ForegroundColor $guideColor
+        Write-Host "  Press Y to run it, or any other key to skip." -ForegroundColor DarkGray
+        Write-Host "-----------------------------------------------" -ForegroundColor $guideColor
+        $guided = Read-Host "Run analysis now? [Y/any key to skip]"
+        if ($guided.Trim().ToUpper() -eq "Y") {
+            ComprehensiveBatteryAnalysis
+            continue
+        }
+        Show-Header
+    }
 
     # Build alert suffix for battery-related menu items
     # Shown next to Options 4 and 5 when any battery is Fair, Poor, or Critical
