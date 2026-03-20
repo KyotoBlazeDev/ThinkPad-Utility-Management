@@ -400,10 +400,23 @@ function Get-SystemInfo {
         }
     } catch {}
 
+    # Environment detection: domain-joined vs standalone workgroup
+    $environment = "Standalone / Workgroup"
+    $domainName  = ""
+    try {
+        $cs2 = Get-CimInstance -CimSession $script:CimSession -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+        if ($cs2 -and $cs2.PartOfDomain) {
+            $environment = "Domain-Joined (Enterprise)"
+            $domainName  = if ($cs2.Domain) { $cs2.Domain } else { "" }
+        }
+    } catch {}
+
     $script:SystemInfo = [PSCustomObject]@{
         Model       = $model
         BIOSVersion = $biosVersion
         BIOSDate    = $biosDate
+        Environment = $environment
+        DomainName  = $domainName
     }
 
     return $script:SystemInfo
@@ -686,65 +699,56 @@ function Show-Header {
     Clear-Host
     $si = Get-SystemInfo
     Write-Host "==============================================="
-    Write-Host "  THINKPAD UTILITY MANAGEMENT DASHBOARD V.1.1"
+    Write-Host "  THINKPAD UTILITY MANAGEMENT DASHBOARD V.1.2"
     Write-Host "==============================================="
-    Write-Host "Device : $env:COMPUTERNAME"
-    Write-Host "Model  : $($si.Model)"
-    Write-Host "BIOS   : $($si.BIOSVersion)  ($($si.BIOSDate))"
 
-    # ── Battery summary line ─────────────────────────────────────────────
-    # Shown on every screen. On PowerBridge ThinkPads with two batteries,
-    # each battery is shown individually so degradation on either one is
-    # immediately visible without navigating into any menu option.
-    # Format: "Battery 0: Good (91%)  |  Battery 1: Poor (52%)"
-    # Each token is coloured by its own severity — good batteries stay white,
-    # degraded ones are highlighted so the problem stands out at a glance.
+    # ── [ SYSTEM INFO ] ──────────────────────────────────────────────────
+    Write-Host "[ SYSTEM INFO ]" -ForegroundColor Cyan
+    Write-Host "  Device      : $env:COMPUTERNAME"
+    Write-Host "  Model       : $($si.Model)"
+    Write-Host "  BIOS        : $($si.BIOSVersion)  ($($si.BIOSDate))"
+    # Environment: show domain name when joined, plain label otherwise
+    $envDisplay = if ($si.DomainName) { "$($si.Environment)  ($($si.DomainName))" } else { $si.Environment }
+    $envColor   = if ($si.Environment -match "Domain") { "Cyan" } else { "DarkGray" }
+    Write-Host "  Environment : " -NoNewline
+    Write-Host $envDisplay -ForegroundColor $envColor
+    Write-Host ""
+
+    # ── [ BATTERY STATUS ] ───────────────────────────────────────────────
+    Write-Host "[ BATTERY STATUS ]" -ForegroundColor Cyan
     if ($script:BatteryAlert -and $script:BatteryAlert.Available) {
-        Write-Host "Battery: " -NoNewline
-        $tokens = $script:BatteryAlert.Batteries
-        for ($i = 0; $i -lt $tokens.Count; $i++) {
-            $b = $tokens[$i]
-            $bColor = switch ($b.Severity) {
-                0 { "White" }; 1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
-                default { "White" }
-            }
-            $label = if ($b.BatteryID -and $b.BatteryID -ne "Unavailable") {
-                $b.BatteryID
-            } else {
-                "Battery $($b.Index)"
-            }
-            $bEmoji = switch ($b.Severity) {
-                0 { "✔" }; 1 { "⚠" }; 2 { "⚠" }; 3 { "✖" }; 4 { "✖" }
-                default { "" }
-            }
-            Write-Host "$bEmoji $label`: $($b.Classification) ($($b.HealthPercent)%)" -ForegroundColor $bColor -NoNewline
-            if ($i -lt $tokens.Count - 1) { Write-Host "  |  " -NoNewline }
-        }
-        # Append action hint if any battery needs attention
-        if ($script:BatteryAlert.WorstSeverity -ge 1) {
-            Write-Host "  [Options 4 or 5]" -ForegroundColor DarkGray
+        $worst  = $script:BatteryAlert.WorstSeverity
+        $emoji  = @{0="  OK"; 1="⚠"; 2="⚠"; 3="❗"; 4="🔥"}[$worst]
+        $phrase = @{0="Healthy"; 1="Below 80%"; 2="Poor"; 3="Critical"; 4="FAILURE"}[$worst]
+        $color  = @{0="Green"; 1="Cyan"; 2="Yellow"; 3="Magenta"; 4="Red"}[$worst]
+        Write-Host "  Health      : " -NoNewline
+        Write-Host "$emoji $phrase" -ForegroundColor $color -NoNewline
+        if ($worst -ge 1) {
+            Write-Host "  → see option 5" -ForegroundColor DarkGray
         } else {
             Write-Host ""
         }
+    } else {
+        Write-Host "  Health      : " -NoNewline
+        Write-Host "Not detected / limited info" -ForegroundColor DarkGray
     }
 
     if ($script:ErrorLog.Count -gt 0) {
-        Write-Host "Errors : " -NoNewline
+        Write-Host "  Issues      : " -NoNewline
         Write-Host "$($script:ErrorLog.Count) error(s) logged this session  [Option 13 to view]" -ForegroundColor Red
     }
-
-    # ── Prominent top-line warning banner (#1) ───────────────────────────
-    # Displayed on every screen whenever any battery has Severity >= 1
-    # (i.e. health below 80%) or is flagged as non-genuine.
-    # Uses a full-width bordered block to ensure it cannot be overlooked,
-    # even by users who open the script for an unrelated reason.
+    Write-Host ""
+    # Displayed whenever any battery has Severity >= 1 (health below 80%).
+    # Shows each affected battery individually on its own line with its
+    # classification and percentage, so PowerBridge dual-battery models
+    # report both cells clearly.
     if ($script:BatteryAlert -and $script:BatteryAlert.Available -and $script:BatteryAlert.WorstSeverity -ge 1) {
         $bannerColor = switch ($script:BatteryAlert.WorstSeverity) {
             1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
             default { "Yellow" }
         }
         $bannerIcon = switch ($script:BatteryAlert.WorstSeverity) {
-            1 { "⚠" }; 2 { "⚠" }; 3 { "✖" }; 4 { "✖" }
+            1 { "⚠" }; 2 { "⚠" }; 3 { "❗" }; 4 { "🔥" }
             default { "⚠" }
         }
         $bannerLabel = switch ($script:BatteryAlert.WorstSeverity) {
@@ -907,7 +911,7 @@ function BatteryStaticData {
             $index = 0
             foreach ($bat in $batteries) {
                 try {
-                    $deviceID = Get-SafeWmiProperty -Object $bat -PropertyName "DeviceID"
+                    $deviceID = Get-SafeWmiProperty -Object $bat -PropertyName "DeviceName"
                     $manufacturer = Get-SafeWmiProperty -Object $bat -PropertyName "ManufactureName"
                     $serial = Get-SafeWmiProperty -Object $bat -PropertyName "SerialNumber"
                     $designCapacity = Get-SafeWmiProperty -Object $bat -PropertyName "DesignedCapacity"
@@ -922,7 +926,7 @@ function BatteryStaticData {
                     $index++
                 }
                 catch {
-                    Log-BatteryError "root\wmi" "BatteryStaticData" $_ $index $($bat.DeviceID) $null
+                    Log-BatteryError "root\wmi" "BatteryStaticData" $_ $index $($bat.DeviceName) $null
                     Write-Host "Battery processing failed." -ForegroundColor Red
                     Write-Host ""
                     $index++
@@ -934,6 +938,26 @@ function BatteryStaticData {
         Log-Error "root\wmi" "BatteryStaticData" $_
         Write-Host "Failed to query battery information." -ForegroundColor Red
     }
+
+    # ── Battery Replacement Safety Warning ───────────────────────────────────
+    Write-Host "[ Replacement Safety Warning ]" -ForegroundColor Yellow
+    Write-Host ("-" * 50) -ForegroundColor DarkGray
+    Write-Host "EN  " -ForegroundColor Cyan -NoNewline
+    Write-Host "Replace with same type only. Use of another battery"
+    Write-Host "    may present a risk of fire or explosion."
+    Write-Host "    PLEASE REFER TO USER MANUAL OR FOLLOW LOCAL ORDINANCES AND/OR REGULATIONS FOR DISPOSAL"
+    Write-Host ""
+    Write-Host "FR  " -ForegroundColor Cyan -NoNewline
+    Write-Host "Remplacer par le même type uniquement. L'utilisation"
+    Write-Host "    d'un autre type peut provoquer un incendie ou une explosion."
+    Write-Host "    Mettre au rebut les batteries usagées selon les ordonnances et réglementations locales."
+    Write-Host ""
+    Write-Host "ID  " -ForegroundColor Cyan -NoNewline
+    Write-Host "Ganti hanya dengan jenis yang sama. Penggunaan baterai"
+    Write-Host "    lain dapat menimbulkan risiko kebakaran atau ledakan."
+    Write-Host "    Buang baterai bekas sesuai peraturan dan ketentuan setempat."
+    Write-Host ("-" * 50) -ForegroundColor DarkGray
+    Write-Host ""
 
     Read-Host "Press ENTER"
 }
@@ -1727,238 +1751,204 @@ function ComprehensiveBatteryAnalysis {
 
 function ExportReport {
 
-    $reportPath = "$env:USERPROFILE\ThinkPad_Report.txt"
-    $errorPath  = "$env:USERPROFILE\ThinkPad_ErrorLog.txt"
+    $timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
+    $reportPath = "$env:USERPROFILE\Desktop\ThinkPad_Report_$timestamp.txt"
+    $errorPath  = "$env:USERPROFILE\Desktop\ThinkPad_ErrorLog_$timestamp.txt"
 
     [System.Collections.Generic.List[string]]$Report = @()
 
     $si = Get-SystemInfo
+
     $Report += "==============================================="
-    $Report += " THINKPAD UTILITY MANAGEMENT DIAGNOSTIC REPORT"
-    $Report += " Generated : $(Get-Date)"
-    $Report += " Device    : $env:COMPUTERNAME"
-    $Report += " Model     : $($si.Model)"
-    $Report += " BIOS      : $($si.BIOSVersion)  ($($si.BIOSDate))"
+    $Report += " THINKPAD UTILITY MANAGEMENT — DIAGNOSTIC REPORT"
+    $Report += " Generated  : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $Report += " Device     : $env:COMPUTERNAME"
+    $Report += " Model      : $($si.Model)"
+    $Report += " BIOS       : $($si.BIOSVersion)  ($($si.BIOSDate))"
+    $Report += " Environment: $($si.Environment)$(if ($si.DomainName) { "  ($($si.DomainName))" })"
     $Report += "==============================================="
     $Report += ""
 
-    # ---------------- Windows Battery ----------------
+    # ════════════════════════════════════════════════
+    # [ SYSTEM INFO ]
+    # ════════════════════════════════════════════════
+    $Report += "[ SYSTEM INFO ]"
+    $Report += "  Device      : $env:COMPUTERNAME"
+    $Report += "  Model       : $($si.Model)"
+    $Report += "  BIOS        : $($si.BIOSVersion)  ($($si.BIOSDate))"
+    $Report += "  Environment : $($si.Environment)$(if ($si.DomainName) { "  ($($si.DomainName))" })"
+    $Report += ""
+
+    # ════════════════════════════════════════════════
+    # [ BATTERY RAW DATA ]
+    # ════════════════════════════════════════════════
+    $Report += "[ BATTERY RAW DATA ]"
     try {
         if (Test-WmiClass -ClassName "Win32_Battery") {
             $batteries = @(Get-CimInstance -CimSession $script:CimSession -ClassName Win32_Battery -ErrorAction SilentlyContinue)
-
-            $Report += "[ Windows Battery - Win32_Battery ]"
             if (-not $batteries -or $batteries.Count -eq 0) {
-                $Report += "No batteries found."
-            }
-            else {
+                $Report += "  No batteries found."
+            } else {
                 foreach ($bat in $batteries) {
-                    $Report += "Battery ID       : $(Get-SafeWmiProperty -Object $bat -PropertyName 'DeviceID')"
-                    $Report += "Manufacturer     : $(Get-SafeWmiProperty -Object $bat -PropertyName 'Manufacturer')"
-                    $Report += "Serial           : $(Get-SafeWmiProperty -Object $bat -PropertyName 'SerialNumber')"
-                    $Report += "Charge           : $(Get-SafeWmiProperty -Object $bat -PropertyName 'EstimatedChargeRemaining') %"
+                    $Report += "  Battery ID     : $(Get-SafeWmiProperty -Object $bat -PropertyName 'DeviceID')"
+                    $Report += "  Manufacturer   : $(Get-SafeWmiProperty -Object $bat -PropertyName 'Manufacturer')"
+                    $Report += "  Serial         : $(Get-SafeWmiProperty -Object $bat -PropertyName 'SerialNumber')"
+                    $Report += "  Charge         : $(Get-SafeWmiProperty -Object $bat -PropertyName 'EstimatedChargeRemaining') %"
                     $Report += ""
                 }
             }
-            $Report += ""
+        } else {
+            $Report += "  Win32_Battery not available."
         }
-        else {
-            $Report += "[ Windows Battery - Win32_Battery ]"
-            $Report += "Win32_Battery class not available."
-            $Report += ""
-        }
-    }
-    catch {
+    } catch {
         Log-Error "root\cimv2" "Win32_Battery" $_
-        $Report += "[ Windows Battery - Win32_Battery ]"
-        $Report += "Win32_Battery FAILED"
-        $Report += ""
+        $Report += "  Win32_Battery query failed."
     }
 
-    # ---------------- Lenovo Cycles ----------------
     if (Test-LenovoNamespace) {
         try {
             $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
             $cycles = ([string]$odo.Battery_cycles -replace '\D','')
-
-            $Report += "[ Lenovo EC - Lenovo_Odometer ]"
-            $Report += "Cycle Count : $cycles"
-            $Report += "Shock Events: $($odo.Shock_events)"
-            $Report += "Thermal     : $($odo.Thermal_events)"
-            $Report += ""
-        }
-        catch {
+            $Report += "  Cycle Count    : $cycles"
+            $Report += "  Shock Events   : $($odo.Shock_events)"
+            $Report += "  Thermal Events : $($odo.Thermal_events)"
+        } catch {
             Log-Error "root\Lenovo" "Lenovo_Odometer" $_
-            $Report += "Lenovo_Odometer FAILED"
-            $Report += ""
+            $Report += "  Lenovo EC data unavailable."
         }
+    } else {
+        $Report += "  Lenovo EC      : root\Lenovo namespace not available."
     }
-    else {
-        $Report += "[ Lenovo EC - Lenovo_Odometer ]"
-        $Report += "Lenovo WMI provider not available on this system."
-        $Report += ""
-    }
+    $Report += ""
 
-    # ---------------- Warranty ----------------
-    if (Test-LenovoNamespace) {
-        try {
-            $w = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_WarrantyInformation -ErrorAction Stop
-
-            $Report += "[ Warranty - Lenovo_WarrantyInformation ]"
-            $Report += "Serial : $($w.SerialNumber)"
-            $Report += "Start  : $($w.StartDate)"
-            $Report += "End    : $($w.EndDate)"
-            $Report += "Last Sync : $($w.LastUpdateTime)"
-            $Report += ""
-        }
-        catch {
-            Log-Error "root\Lenovo" "Lenovo_WarrantyInformation" $_
-            $Report += "Warranty FAILED"
-            $Report += ""
-        }
-    }
-    else {
-        $Report += "[ Warranty - Lenovo_WarrantyInformation ]"
-        $Report += "Lenovo WMI provider not available on this system."
-        $Report += ""
-    }
-
-    # ---------------- Full Charge Capacity ----------------
+    # ════════════════════════════════════════════════
+    # [ BATTERY ANALYSIS ]
+    # ════════════════════════════════════════════════
+    $Report += "[ BATTERY ANALYSIS ]"
     try {
-        # Get BatteryFullChargedCapacity
-        $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
-
-        $Report += "[ Battery Capacity Health ]"
-
-        if (-not $batteries -or $batteries.Count -eq 0) {
-            $Report += "No battery capacity data found."
-        }
-        else {
-            for ($i = 0; $i -lt $batteries.Count; $i++) {
-                try {
-                    if ($batteries[$i] -and $batteries[$i].FullChargedCapacity) {
-                        $FullCharge = $batteries[$i].FullChargedCapacity
-                        
-                        # Get design capacity via multi-source helper (uses Get-WmiObject + powercfg fallback)
-                        $DesignCapValue = Get-DesignCapacity -Index $i
-                        
-                        $DesignCap = if ($DesignCapValue) { $DesignCapValue } else { "Unavailable" }
-                        $Health     = "Unavailable"
-
-                        # Only calculate health if both values are numeric
-                        [int64]$fc = 0
-                        [int64]$dc = 0
-
-                        if ($null -ne $DesignCapValue -and
-                            [int64]::TryParse($FullCharge.ToString(), [ref]$fc) -and
-                            [int64]::TryParse($DesignCapValue.ToString(), [ref]$dc) -and
-                            $dc -gt 0)
-                        {
-                            $Health = [math]::Round(($fc / $dc) * 100, 2)
-                        }
-                        else {
-                            $Health = "Unavailable"
-                        }
-                        $Report += "Battery #: $i"
-                        $Report += "Instance Name        : $($batteries[$i].InstanceName)"
-                        $Report += "Full Charge Capacity : $FullCharge"
-                        $Report += "Design Capacity      : $DesignCap"
-                        $Report += "Health %             : $Health"
-                        $Report += ""
-                    }
-                    else {
-                        $Report += "Battery #: $i - Data unavailable"
-                        $Report += ""
-                    }
-                }
-                catch {
-                    Log-BatteryError "root\wmi" "BatteryFullChargedCapacity" $_ $i $($batteries[$i].InstanceName) $null
-                    $Report += "Battery #: $i - FAILED"
-                    $Report += ""
-                }
-            }
-        }
-    }
-    catch {
-        Log-Error "root\wmi" "BatteryFullChargedCapacity" $_
-
-        $Report += "ACPI battery data unavailable and Win32_Battery fallback has been removed (ACPI-only mode)."
-    }
-
-    # -------- Comprehensive Battery Analysis --------
-    try {
-        $Report += "[ Comprehensive Battery Analysis ]"
-        $Report += ""
-        
         $reportCycles = 0
         if (Test-LenovoNamespace) {
             try {
-                $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction SilentlyContinue
-                $reportCycles = ([string]$odo.Battery_cycles -replace '\D','')
-                $Report += "Cycle Count  : $reportCycles"
-                $Report += ""
-            }
-            catch {
-                $Report += "Lenovo cycle data unavailable."
-                $Report += ""
-            }
+                $odo2 = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction SilentlyContinue
+                $reportCycles = ([string]$odo2.Battery_cycles -replace '\D','')
+            } catch {}
         }
-        
-        try {
-            $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
-            
-            if ($batteries -and $batteries.Count -gt 0) {
-                $Report += "[ Battery Health Analysis ]"
-                
-                $index = 0
-                foreach ($bat in $batteries) {
-                    try {
-                        $FullCharge = Get-SafeWmiProperty -Object $bat -PropertyName "FullChargedCapacity"
-                        
-                        # Get design capacity and manufacturer via multi-source helpers
-                        $DesignCapValue  = Get-DesignCapacity -Index $index
-                        $Manufacturer    = Get-BatteryManufacturer -Index $index
-                        
-                        $classification = Get-BatteryClassification -DesignCapacity $DesignCapValue -FullChargeCapacity $FullCharge -CycleCount $reportCycles -Manufacturer $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })
-                        
-                        $Report += ""
-                        $Report += "Battery #: $index"
-                        $Report += "  Manufacturer         : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })"
-                        $Report += "  Health Percentage    : $($classification.HealthPercent)%"
-                        $Report += "  Classification       : $($classification.Classification)"
-                        $Report += "  Severity             : $($classification.Severity)/3"
-                        $Report += "  Genuine              : $(if ($classification.IsGenuine) { "Yes" } else { "No - Non-genuine battery" })"
-                        $Report += "  Status               : $($classification.Message)"
-                        $Report += ""
-                        
-                        $index++
-                    }
-                    catch {
-                        $Report += "Battery #: $index - Analysis failed"
-                        $Report += ""
-                    }
+
+        $batteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+        if ($batteries -and $batteries.Count -gt 0) {
+            $index = 0
+            foreach ($bat in $batteries) {
+                try {
+                    $FullCharge     = Get-SafeWmiProperty -Object $bat -PropertyName "FullChargedCapacity"
+                    $DesignCapValue = Get-DesignCapacity -Index $index
+                    $Manufacturer   = Get-BatteryManufacturer -Index $index
+
+                    $classification = Get-BatteryClassification `
+                        -DesignCapacity $DesignCapValue -FullChargeCapacity $FullCharge `
+                        -CycleCount $reportCycles -Manufacturer $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })
+
+                    $healthStatus = if ($classification.Severity -eq 0)     { "PASS" }
+                                    elseif ($classification.Severity -le 1)  { "WARN" }
+                                    else                                      { "FAIL" }
+
+                    $cycleStatus  = if ($reportCycles -eq 0)         { "INFO" }
+                                    elseif ($reportCycles -lt 300)   { "PASS" }
+                                    elseif ($reportCycles -lt 500)   { "WARN" }
+                                    else                             { "FAIL" }
+
+                    $genuineStatus = if ($classification.IsGenuine) { "PASS" } else { "WARN" }
+
+                    $Report += "  Battery $($index + 1)"
+                    $Report += "  Manufacturer   : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })"
+                    $Report += "  Health         : $($classification.HealthPercent)%  [$healthStatus]"
+                    $Report += "  Cycle Count    : $(if ($reportCycles -gt 0) { "$reportCycles" } else { "N/A" })  [$cycleStatus]"
+                    $Report += "  Rating         : $($classification.Classification)"
+                    $Report += "  Genuine        : $(if ($classification.IsGenuine) { "Yes" } else { "No" })  [$genuineStatus]"
+                    $Report += "  Summary        : $($classification.Message)"
+                    $Report += ""
+                    $index++
+                } catch {
+                    $Report += "  Battery $($index + 1) — analysis failed."
+                    $Report += ""
+                    $index++
                 }
             }
-            else {
-                $Report += "No ACPI battery data available for analysis."
-                $Report += ""
-            }
+        } else {
+            $Report += "  No ACPI battery capacity data available."
         }
-        catch {
-            $Report += "Comprehensive analysis unavailable."
-            $Report += ""
-        }
+    } catch {
+        $Report += "  Battery analysis could not be completed."
     }
-    catch {
-        $Report += "[ Comprehensive Battery Analysis ]"
-        $Report += "Unable to generate."
-        $Report += ""
-    }
+    $Report += ""
 
-    # Save report
+    # ════════════════════════════════════════════════
+    # [ LENOVO EC STATUS ]
+    # ════════════════════════════════════════════════
+    $Report += "[ LENOVO EC STATUS ]"
+    if (Test-LenovoNamespace) {
+        try {
+            $w = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_WarrantyInformation -ErrorAction Stop
+            $Report += "  Warranty Serial : $($w.SerialNumber)"
+            $Report += "  Warranty Start  : $($w.StartDate)"
+            $Report += "  Warranty End    : $($w.EndDate)"
+            $Report += "  Last Sync       : $($w.LastUpdateTime)"
+        } catch {
+            $Report += "  Warranty data unavailable."
+        }
+        $cdrt = Get-CdrtOdometerData
+        if ($cdrt.Available) {
+            $Report += "  CPU Uptime      : $(if ($null -ne $cdrt.CpuUptimeMinutes) { "~$([math]::Round($cdrt.CpuUptimeMinutes / 60, 1)) hours" } else { "N/A" })"
+            $Report += "  Shock Events    : $(if ($null -ne $cdrt.ShockEvents) { $cdrt.ShockEvents } else { "N/A" })"
+            $Report += "  Thermal Events  : $(if ($null -ne $cdrt.ThermalEvents) { $cdrt.ThermalEvents } else { "N/A" })"
+        } else {
+            $Report += "  CDRT Odometer   : Vantage not installed — skipped."
+        }
+    } else {
+        $Report += "  root\Lenovo namespace not available on this system."
+    }
+    $Report += ""
+
+    # ════════════════════════════════════════════════
+    # [ MEMORY INFO ]
+    # ════════════════════════════════════════════════
+    $Report += "[ MEMORY INFO ]"
+    try {
+        $mem = Get-MemoryState
+        if ($mem.ModuleCount -gt 0) {
+            $memStatus = if ($mem.SpeedMismatch) { "WARN" } else { "PASS" }
+            $Report += "  Total RAM      : $($mem.TotalRAMGB) GB  [$memStatus]"
+            $Report += "  Modules        : $($mem.ModuleCount)"
+            $Report += "  Speed Mismatch : $(if ($mem.SpeedMismatch) { "Yes  [WARN]" } else { "No  [PASS]" })"
+            $modIdx = 0
+            foreach ($m in $mem.Modules) {
+                $Report += "  Module $($modIdx + 1)       : $($m.CapacityGB) GB  $($m.SpeedMHz) MHz  ($($m.Manufacturer))"
+                $modIdx++
+            }
+        } else {
+            $Report += "  $($mem.Message)"
+        }
+    } catch {
+        $Report += "  Memory data unavailable."
+    }
+    $Report += ""
+
+    # ════════════════════════════════════════════════
+    # [ DEPLOYMENT READINESS ]
+    # ════════════════════════════════════════════════
+    $Report += "[ DEPLOYMENT READINESS ]"
+    $dr = Get-DeploymentReadiness
+    foreach ($key in $dr.Checks.Keys) {
+        $chk   = $dr.Checks[$key]
+        $label = $key.PadRight(20)
+        $Report += "  $label : $($chk.Value)  [$($chk.Status)]"
+    }
+    $Report += ""
+    $Report += "  Status : $($dr.Status)"
+    $Report += ""
+
+    # ── Save ─────────────────────────────────────────────────────────────
     $Report | Out-File $reportPath -Encoding UTF8
 
-    # Save errors if exist - with detailed exception info
     if ($script:ErrorLog.Count -gt 0) {
         $ErrorOutput = @()
         foreach ($err in $script:ErrorLog) {
@@ -1969,9 +1959,7 @@ function ExportReport {
             $ErrorOutput += "Message         : $($err.Message)"
             $ErrorOutput += "ScriptName      : $($err.ScriptName)"
             $ErrorOutput += "ScriptLineNumber: $($err.ScriptLineNumber)"
-            if ($err.Context) {
-                $ErrorOutput += "Context         : $($err.Context)"
-            }
+            if ($err.Context)       { $ErrorOutput += "Context         : $($err.Context)" }
             if ($err.BatteryDetails) {
                 $ErrorOutput += "Battery Details :"
                 $ErrorOutput += "  - InstanceName       : $($err.BatteryDetails.InstanceName)"
@@ -1986,21 +1974,351 @@ function ExportReport {
 
     Show-Header
     Write-Host "Report saved to:" -ForegroundColor Green
-    Write-Host $reportPath
+    Write-Host "  $reportPath"
 
     if ($script:ErrorLog.Count -gt 0) {
         Write-Host ""
-        Write-Host "Errors saved to:" -ForegroundColor Yellow
-        Write-Host $errorPath
+        Write-Host "Error log saved to:" -ForegroundColor Yellow
+        Write-Host "  $errorPath"
     }
 
     Read-Host "Press ENTER"
 }
 
+function Write-BatteryTrendLog {
+    <#
+    .SYNOPSIS
+    Appends a battery health snapshot to the persistent trend log CSV.
+
+    .DESCRIPTION
+    Called silently on every script run after Get-BatteryAlertState has
+    populated $script:BatteryAlert. Writes one row per battery per run to:
+      $env:LOCALAPPDATA\LenovoUtility\battery_trend.csv
+
+    Columns: Timestamp, BatteryIndex, BatteryID, FullCharge, DesignCapacity,
+             HealthPct, CycleCount
+
+    Duplicate suppression: if the most recent entry for a given BatteryIndex
+    was written within the last 20 hours, the row is skipped — so rapid
+    successive runs (e.g. testing) don't inflate the log.
+    #>
+
+    try {
+        $logDir  = Join-Path $env:LOCALAPPDATA "LenovoUtility"
+        $logPath = Join-Path $logDir "battery_trend.csv"
+
+        if (-not (Test-Path $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
+
+        # Load existing rows for duplicate suppression
+        $existing = @()
+        if (Test-Path $logPath) {
+            try { $existing = @(Import-Csv $logPath) } catch {}
+        }
+
+        $now = Get-Date
+
+        # Collect per-battery data from ACPI (always available, source-agnostic)
+        $acpiBatteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+
+        # Also try Lenovo_Battery for cycle count
+        $lbBatteries = @()
+        if ((Test-LenovoNamespace) -and (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Battery")) {
+            try {
+                $lbBatteries = @(Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Battery -ErrorAction SilentlyContinue)
+            } catch {}
+        }
+
+        # Fallback cycle count from Lenovo_Odometer
+        $odoObj = $null
+        if ($lbBatteries.Count -eq 0 -and (Test-LenovoNamespace) -and (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Odometer")) {
+            try {
+                $odoObj = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction SilentlyContinue
+            } catch {}
+        }
+
+        $newRows = @()
+
+        for ($i = 0; $i -lt $acpiBatteries.Count; $i++) {
+            try {
+                [int64]$fc = 0
+                if (-not ([int64]::TryParse(
+                    (Get-SafeWmiProperty -Object $acpiBatteries[$i] -PropertyName "FullChargedCapacity"),
+                    [ref]$fc))) { continue }
+
+                $dcRaw = Get-DesignCapacity -Index $i
+                [int64]$dc = 0
+                if (-not ([int64]::TryParse(($dcRaw -replace '\D',''), [ref]$dc)) -or $dc -le 0) { continue }
+
+                # Cap at 100 — FullCharge can exceed DesignCapacity on some firmware
+                # (e.g. BYD L24B4PC0 reports ~85160 mWh against 80000 mWh design).
+                # Values above 100% are firmware noise, not genuine overcapacity.
+                $healthPct = [math]::Min([math]::Round(($fc / $dc) * 100, 2), 100.0)
+
+                # Cycle count — prefer Lenovo_Battery, fall back to Lenovo_Odometer
+                $cycles = ""
+                if ($i -lt $lbBatteries.Count) {
+                    $rawCyc = Get-SafeWmiProperty -Object $lbBatteries[$i] -PropertyName "CycleCount"
+                    [int64]$cyc = 0
+                    if ([int64]::TryParse(($rawCyc -replace '\D',''), [ref]$cyc)) { $cycles = $cyc }
+                } elseif ($odoObj) {
+                    [int64]$cyc = 0
+                    if ([int64]::TryParse(([string]$odoObj.Battery_cycles -replace '\D',''), [ref]$cyc)) { $cycles = $cyc }
+                }
+
+                # Battery ID from alert cache or fallback label
+                $batteryID = "Battery $i"
+                if ($script:BatteryAlert -and $script:BatteryAlert.Batteries -and $i -lt $script:BatteryAlert.Batteries.Count) {
+                    $cachedID = $script:BatteryAlert.Batteries[$i].BatteryID
+                    if ($cachedID -and $cachedID -ne "Unavailable") { $batteryID = $cachedID }
+                }
+
+                # Duplicate suppression — skip if logged within last 20 hours for this index
+                $recentEntry = $existing |
+                    Where-Object { $_.BatteryIndex -eq $i } |
+                    Sort-Object Timestamp |
+                    Select-Object -Last 1
+
+                if ($recentEntry) {
+                    try {
+                        $lastTime = [datetime]::Parse($recentEntry.Timestamp)
+                        if (($now - $lastTime).TotalHours -lt 20) { continue }
+                    } catch {}
+                }
+
+                $newRows += [PSCustomObject]@{
+                    Timestamp      = $now.ToString("yyyy-MM-dd HH:mm:ss")
+                    BatteryIndex   = $i
+                    BatteryID      = $batteryID
+                    FullCharge     = $fc
+                    DesignCapacity = $dc
+                    HealthPct      = $healthPct
+                    CycleCount     = $cycles
+                }
+            } catch {}
+        }
+
+        if ($newRows.Count -gt 0) {
+            $newRows | Export-Csv -Path $logPath -Append -NoTypeInformation -Force
+        }
+    } catch {}
+}
+
+function Show-BatteryHealthTrend {
+    <#
+    .SYNOPSIS
+    Displays the battery health trend from the persistent log, including
+    degradation rate and projection to the 80% replacement threshold.
+    #>
+
+    Clear-Host
+    Write-Host "==============================================="
+    Write-Host "  BATTERY HEALTH TREND"
+    Write-Host "==============================================="
+    Write-Host ""
+
+    $logPath = Join-Path $env:LOCALAPPDATA "LenovoUtility\battery_trend.csv"
+
+    if (-not (Test-Path $logPath)) {
+        Write-Host "No trend data found yet." -ForegroundColor Yellow
+        Write-Host "The log is written silently each time you run this script." -ForegroundColor DarkGray
+        Write-Host "Run the script a few times over days or weeks to build a history." -ForegroundColor DarkGray
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    $rows = @()
+    try { $rows = @(Import-Csv $logPath) } catch {
+        Write-Host "Failed to read trend log: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    if ($rows.Count -eq 0) {
+        Write-Host "Trend log is empty." -ForegroundColor Yellow
+        Write-Host ""
+        Read-Host "Press ENTER"
+        return
+    }
+
+    # Group by BatteryIndex
+    $indices = $rows | Select-Object -ExpandProperty BatteryIndex -Unique | Sort-Object
+
+    foreach ($idx in $indices) {
+        $battRows = @($rows | Where-Object { $_.BatteryIndex -eq $idx } | Sort-Object Timestamp)
+
+        $battID = $battRows[-1].BatteryID
+        Write-Host "Battery: $battID  (Index $idx)" -ForegroundColor Cyan
+        Write-Host ("-" * 50)
+
+        # Table header
+        Write-Host ("  {0,-20} {1,8} {2,8} {3,10}" -f "Date", "Health%", "FullChg", "Cycles")
+        Write-Host ("  {0,-20} {1,8} {2,8} {3,10}" -f "--------------------", "-------", "-------", "------")
+
+        foreach ($row in $battRows) {
+            [double]$hp = 0
+            [double]::TryParse($row.HealthPct, [ref]$hp) | Out-Null
+            $color = if ($hp -ge 80) { "Green" } elseif ($hp -ge 70) { "Yellow" } elseif ($hp -ge 60) { "Magenta" } else { "Red" }
+            $cycleDisplay = if ($row.CycleCount) { $row.CycleCount } else { "N/A" }
+            Write-Host ("  {0,-20} " -f $row.Timestamp) -NoNewline
+            Write-Host ("{0,7}% " -f $row.HealthPct) -ForegroundColor $color -NoNewline
+            Write-Host ("{0,8} {1,10}" -f $row.FullCharge, $cycleDisplay)
+        }
+
+        Write-Host ""
+
+        # Trend analysis — need at least 2 entries with parseable timestamps
+        $parsed = @()
+        foreach ($row in $battRows) {
+            [double]$hp = 0
+            $ts = $null
+            try { $ts = [datetime]::Parse($row.Timestamp) } catch { continue }
+            if (-not [double]::TryParse($row.HealthPct, [ref]$hp)) { continue }
+            $parsed += [PSCustomObject]@{ Timestamp = $ts; HealthPct = $hp }
+        }
+
+        if ($parsed.Count -lt 2) {
+            Write-Host "  Not enough data points for trend analysis yet." -ForegroundColor DarkGray
+            Write-Host "  (Need at least 2 entries recorded on different days)" -ForegroundColor DarkGray
+            Write-Host ""
+            continue
+        }
+
+        $first = $parsed[0]
+        $last  = $parsed[-1]
+        $spanDays = ($last.Timestamp - $first.Timestamp).TotalDays
+
+        if ($spanDays -lt 1) {
+            Write-Host "  All entries recorded on the same day — run again later for trend data." -ForegroundColor DarkGray
+            Write-Host ""
+            continue
+        }
+
+        if ($spanDays -lt 14) {
+            Write-Host "  Insufficient span — need at least 14 days of data for a reliable rate." -ForegroundColor DarkGray
+            Write-Host "  Span so far: $([math]::Round($spanDays)) days  ($($parsed.Count) entries)" -ForegroundColor DarkGray
+            Write-Host "  Current Health   : " -NoNewline
+            $hpColor = if ($last.HealthPct -ge 80) { "Green" } elseif ($last.HealthPct -ge 70) { "Yellow" } elseif ($last.HealthPct -ge 60) { "Magenta" } else { "Red" }
+            Write-Host ("{0:N2}%" -f $last.HealthPct) -ForegroundColor $hpColor
+            Write-Host ""
+            continue
+        }
+
+        $totalDrop    = $first.HealthPct - $last.HealthPct
+        $dropPerDay   = $totalDrop / $spanDays
+        $dropPerMonth = [math]::Round($dropPerDay * 30.44, 2)
+        $currentHP    = $last.HealthPct
+
+        # Rate colour coding
+        $rateColor = if ($dropPerMonth -le 1.5) { "Green" } elseif ($dropPerMonth -le 3.0) { "Yellow" } else { "Red" }
+        $rateLabel = if ($dropPerMonth -le 1.5) { "Normal" } elseif ($dropPerMonth -le 3.0) { "Elevated" } else { "Accelerated" }
+
+        Write-Host "  Degradation Rate : " -NoNewline
+        Write-Host ("{0:N2}%/month  ({1})" -f $dropPerMonth, $rateLabel) -ForegroundColor $rateColor
+
+        Write-Host "  Span             : $([math]::Round($spanDays)) days  ($($parsed.Count) entries)"
+        Write-Host "  Current Health   : " -NoNewline
+        $hpColor = if ($currentHP -ge 80) { "Green" } elseif ($currentHP -ge 70) { "Yellow" } elseif ($currentHP -ge 60) { "Magenta" } else { "Red" }
+        Write-Host ("{0:N2}%" -f $currentHP) -ForegroundColor $hpColor
+
+        # Projection to 80% threshold
+        if ($dropPerMonth -gt 0 -and $currentHP -gt 80) {
+            $monthsTo80 = [math]::Round(($currentHP - 80) / $dropPerMonth, 1)
+            $dateTo80   = (Get-Date).AddDays($monthsTo80 * 30.44)
+            Write-Host "  Est. 80% reached : in ~$monthsTo80 months  (approx. $($dateTo80.ToString('MMM yyyy')))" -ForegroundColor $rateColor
+        } elseif ($currentHP -le 80) {
+            Write-Host "  Battery is already at or below the 80% replacement threshold." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Rate too low to project meaningfully." -ForegroundColor DarkGray
+        }
+
+        Write-Host ""
+    }
+
+    Write-Host "Log file: $logPath" -ForegroundColor DarkGray
+    Write-Host ""
+    Read-Host "Press ENTER"
+}
+
+function Get-BatteryCapacityHistory {
+    <#
+    .SYNOPSIS
+    Parses the capacity history table from powercfg /batteryreport /XML.
+
+    .DESCRIPTION
+    The battery report XML contains a CapacityHistory section that records
+    full charge capacity and design capacity at regular intervals (typically
+    weekly). This gives a real observed degradation curve rather than a
+    single snapshot, enabling slope-based age estimation.
+
+    Returns an array of PSCustomObjects sorted oldest-first:
+      Timestamp       - DateTime of the measurement
+      FullCharge      - Full charge capacity in mWh
+      DesignCapacity  - Design capacity in mWh
+      HealthPct       - FullCharge / DesignCapacity * 100 (rounded to 2dp)
+
+    Returns an empty array if the report cannot be generated or parsed.
+    The XML file is written to %TEMP% and deleted immediately after parsing.
+    #>
+
+    $entries = @()
+
+    try {
+        $xmlPath = Join-Path $env:TEMP "battery_history_$PID.xml"
+        $null = & powercfg /batteryreport /XML /OUTPUT $xmlPath 2>$null
+
+        if (-not (Test-Path $xmlPath)) { return $entries }
+
+        [xml]$report = Get-Content $xmlPath -ErrorAction Stop
+        Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+
+        $historyNodes = $report.BatteryReport.History.HistoryEntry
+        if (-not $historyNodes) { return $entries }
+
+        foreach ($node in $historyNodes) {
+            try {
+                [int64]$fc = 0
+                [int64]$dc = 0
+                if (-not ([int64]::TryParse($node.FullChargeCapacity, [ref]$fc))) { continue }
+                if (-not ([int64]::TryParse($node.DesignCapacity,     [ref]$dc))) { continue }
+                if ($dc -le 0 -or $fc -le 0) { continue }
+
+                # powercfg uses ISO 8601 UTC timestamps in StartDate.
+                # Use LocalStartDate when available for a human-readable local time.
+                $ts = $null
+                $tsStr = if ($node.LocalStartDate) { $node.LocalStartDate } else { $node.StartDate }
+                try { $ts = [datetime]::Parse($tsStr) } catch { continue }
+
+                # CycleCount is present per entry — capture it for the newest entry
+                [int64]$cc = 0
+                [int64]::TryParse($node.CycleCount, [ref]$cc) | Out-Null
+
+                $entries += [PSCustomObject]@{
+                    Timestamp      = $ts
+                    FullCharge     = $fc
+                    DesignCapacity = $dc
+                    HealthPct      = [math]::Round(($fc / $dc) * 100, 2)
+                    CycleCount     = $cc
+                }
+            }
+            catch {}
+        }
+
+        # Sort oldest first
+        $entries = $entries | Sort-Object Timestamp
+    }
+    catch {}
+
+    return $entries
+}
+
 function Get-BatteryAgeEstimate {
     <#
     .SYNOPSIS
-    Estimates battery age in years using two independent methods and cross-validates them.
+    Estimates battery age in years using three independent methods and cross-validates them.
 
     Method 1 - Cycle-based:
       Average laptop user does ~200-300 cycles/year (partial cycles, plugged in sometimes).
@@ -2013,23 +2331,34 @@ function Get-BatteryAgeEstimate {
       We use a simplified linear model: 100% health = 0 years, 0% health = ~5 years.
       This is conservative and matches real-world laptop battery observations.
 
-    If both estimates agree within 1 year, confidence is High.
+    Method 3 - History-based (slope):
+      Uses the capacity history from powercfg /batteryreport /XML to compute the
+      observed degradation rate (% per day) across all recorded entries. Extrapolates
+      how long ago health was at 100% using that real measured slope. This is the
+      most accurate method when sufficient history is available (>= 4 weeks of data).
+
+    If methods agree within 1 year, confidence is High.
     If they diverge by 1-2 years, confidence is Medium with a likely explanation.
     If they diverge by more than 2 years, confidence is Low with usage pattern notes.
     #>
     param(
         [object]$CycleCount,
-        [object]$HealthPercent
+        [object]$HealthPercent,
+        [object[]]$CapacityHistory = @()
     )
 
     $result = [PSCustomObject]@{
         CycleBasedYears    = $null
         CapacityBasedYears = $null
+        HistoryBasedYears  = $null
         EstimatedYears     = $null
         Confidence         = "Unknown"
         Note               = ""
         HasCycleData       = $false
         HasCapacityData    = $false
+        HasHistoryData     = $false
+        HistoryEntryCount  = 0
+        HistorySpanDays    = 0
     }
 
     # --- Method 1: Cycle-based estimate ---
@@ -2043,55 +2372,118 @@ function Get-BatteryAgeEstimate {
     # --- Method 2: Capacity-based estimate ---
     [double]$health = 0
     if ($HealthPercent -and [double]::TryParse([string]$HealthPercent, [ref]$health) -and $health -gt 0) {
-        # Capacity loss model: battery rated for ~5 years at 0% health (fully degraded)
-        # 100% health = new (0 years), linear degradation to end of useful life
         $capacityLoss = 100 - $health
-        # Each ~4% loss per year is the baseline (20% loss over ~5 years)
         $result.CapacityBasedYears = [math]::Round($capacityLoss / 4.0, 1)
         if ($result.CapacityBasedYears -lt 0) { $result.CapacityBasedYears = 0 }
         $result.HasCapacityData = $true
     }
 
-    # --- Cross-validate and determine confidence ---
-    if ($result.HasCycleData -and $result.HasCapacityData) {
-        $diff = [math]::Abs($result.CycleBasedYears - $result.CapacityBasedYears)
-        # Use weighted average (capacity slightly more reliable for calendar aging)
-        $result.EstimatedYears = [math]::Round(($result.CycleBasedYears * 0.45 + $result.CapacityBasedYears * 0.55), 1)
+    # --- Method 3: History-based slope estimate ---
+    # Requires at least 2 entries spanning at least 7 days to produce a
+    # meaningful slope. With fewer entries the slope is too noisy to trust.
+    if ($CapacityHistory -and $CapacityHistory.Count -ge 2) {
+        $result.HistoryEntryCount = $CapacityHistory.Count
 
-        if ($diff -le 1.0) {
-            $result.Confidence = "High"
-            $result.Note = "Both methods agree. Estimate is reliable."
-        }
-        elseif ($diff -le 2.0) {
-            $result.Confidence = "Medium"
-            if ($result.CycleBasedYears -lt $result.CapacityBasedYears) {
-                $result.Note = "Capacity has degraded more than cycles suggest. Battery may have experienced high temperatures or prolonged storage at full charge."
-            } else {
-                $result.Note = "More cycles than capacity loss suggests. Battery may have been lightly used per cycle (partial discharges) or kept in cool conditions."
+        $oldest = $CapacityHistory[0]
+        $newest = $CapacityHistory[-1]
+        $spanDays = ($newest.Timestamp - $oldest.Timestamp).TotalDays
+        $result.HistorySpanDays = [math]::Round($spanDays, 0)
+
+        if ($spanDays -ge 7) {
+            $healthDrop = $oldest.HealthPct - $newest.HealthPct
+
+            if ($healthDrop -gt 0) {
+                $ratePerDay = $healthDrop / $spanDays
+                $totalDaysToReach100 = (100 - $newest.HealthPct) / $ratePerDay
+                $result.HistoryBasedYears = [math]::Round($totalDaysToReach100 / 365, 1)
+                if ($result.HistoryBasedYears -lt 0) { $result.HistoryBasedYears = 0 }
+                $result.HasHistoryData = $true
             }
+            elseif ($healthDrop -le 0) {
+                # No measurable degradation in the history window
+                $result.HistoryBasedYears = 0
+                $result.HasHistoryData = $true
+            }
+        }
+    }
+
+    # --- Cross-validate and determine confidence ---
+    $availableEstimates = @()
+    if ($result.HasCycleData)    { $availableEstimates += $result.CycleBasedYears }
+    if ($result.HasCapacityData) { $availableEstimates += $result.CapacityBasedYears }
+    if ($result.HasHistoryData)  { $availableEstimates += $result.HistoryBasedYears }
+
+    if ($availableEstimates.Count -eq 0) {
+        $result.Confidence = "Unknown"
+        $result.Note = "Insufficient data. Neither cycle count, health percentage, nor capacity history is available."
+        return $result
+    }
+
+    if ($availableEstimates.Count -eq 1) {
+        $result.EstimatedYears = $availableEstimates[0]
+        $result.Confidence = "Medium"
+        if ($result.HasHistoryData) {
+            $result.Note = "History-based estimate only ($($result.HistoryEntryCount) entries, $($result.HistorySpanDays) days). No other data available for cross-validation."
+        }
+        elseif ($result.HasCycleData) {
+            $result.Note = "Cycle-based estimate only. No capacity data available for cross-validation."
         }
         else {
-            $result.Confidence = "Low"
-            if ($result.CycleBasedYears -lt $result.CapacityBasedYears) {
-                $result.Note = "Significant divergence: capacity loss greatly exceeds cycle count. Likely calendar aging from long-term storage or heat exposure."
-            } else {
-                $result.Note = "Significant divergence: high cycle count but capacity well preserved. Possible shallow cycling habits or battery replacement."
-            }
+            $result.Note = "Capacity-based estimate only. No cycle data available for cross-validation."
         }
+        return $result
     }
-    elseif ($result.HasCycleData) {
-        $result.EstimatedYears = $result.CycleBasedYears
-        $result.Confidence = "Medium"
-        $result.Note = "Cycle-based estimate only. No capacity data available for cross-validation."
-    }
-    elseif ($result.HasCapacityData) {
-        $result.EstimatedYears = $result.CapacityBasedYears
-        $result.Confidence = "Medium"
-        $result.Note = "Capacity-based estimate only. No cycle data available for cross-validation."
+
+    $avg  = ($availableEstimates | Measure-Object -Average).Average
+    $max  = ($availableEstimates | Measure-Object -Maximum).Maximum
+    $min  = ($availableEstimates | Measure-Object -Minimum).Minimum
+    $diff = $max - $min
+
+    # Weight history more heavily when span is long (>= 90 days)
+    if ($result.HasHistoryData -and $result.HistorySpanDays -ge 90) {
+        $otherCount    = $availableEstimates.Count - 1
+        $historyWeight = 0.50
+        $otherWeight   = if ($otherCount -gt 0) { 0.50 / $otherCount } else { 0 }
+        $weighted = $result.HistoryBasedYears * $historyWeight
+        if ($result.HasCycleData)    { $weighted += $result.CycleBasedYears    * $otherWeight }
+        if ($result.HasCapacityData) { $weighted += $result.CapacityBasedYears * $otherWeight }
+        $result.EstimatedYears = [math]::Round($weighted, 1)
     }
     else {
-        $result.Confidence = "Unknown"
-        $result.Note = "Insufficient data. Neither cycle count nor health percentage is available."
+        $result.EstimatedYears = [math]::Round($avg, 1)
+    }
+
+    if ($diff -le 1.0) {
+        $result.Confidence = "High"
+        $methodCount = $availableEstimates.Count
+        $result.Note = "All $methodCount methods agree. Estimate is reliable."
+    }
+    elseif ($diff -le 2.0) {
+        $result.Confidence = "Medium"
+        if ($result.HasHistoryData -and $result.HasCycleData -and
+            $result.HistoryBasedYears -lt $result.CycleBasedYears) {
+            $result.Note = "History shows slower degradation than cycles suggest. Battery may have been partially cycled or used in cool conditions."
+        }
+        elseif ($result.HasCapacityData -and $result.HasCycleData -and
+                $result.CycleBasedYears -lt $result.CapacityBasedYears) {
+            $result.Note = "Capacity has degraded more than cycles suggest. Battery may have experienced high temperatures or prolonged storage at full charge."
+        }
+        else {
+            $result.Note = "Methods show minor divergence. Estimate is approximate."
+        }
+    }
+    else {
+        $result.Confidence = "Low"
+        if ($result.HasHistoryData -and $result.HistorySpanDays -lt 30) {
+            $result.Note = "Significant divergence. Capacity history span is short ($($result.HistorySpanDays) days) -- slope estimate may not be representative yet."
+        }
+        elseif ($result.HasCycleData -and $result.HasCapacityData -and
+                $result.CycleBasedYears -lt $result.CapacityBasedYears) {
+            $result.Note = "Significant divergence: capacity loss greatly exceeds cycle count. Likely calendar aging from long-term storage or heat exposure."
+        }
+        else {
+            $result.Note = "Significant divergence between methods. Actual age may vary considerably."
+        }
     }
 
     return $result
@@ -2106,7 +2498,7 @@ function BatteryAgeEstimation {
     $health = $null
 
     # --- Get cycle count from Lenovo EC ---
-    if (Test-LenovoNamespace) {
+    if ((Test-LenovoNamespace) -and (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Odometer")) {
         try {
             $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
             $cycles = ([string]$odo.Battery_cycles -replace '\D','')
@@ -2152,10 +2544,42 @@ function BatteryAgeEstimation {
         Write-Host "Health Percentage        : Unavailable" -ForegroundColor Yellow
     }
 
+    # --- Collect capacity history from powercfg battery report ---
+    Write-Host ""
+    Write-Host "[ Capacity History ]"
+    Write-Host "Reading battery report..." -ForegroundColor Cyan
+    $history = Get-BatteryCapacityHistory
+
+    if ($history -and $history.Count -ge 2) {
+        $spanDays = [math]::Round(($history[-1].Timestamp - $history[0].Timestamp).TotalDays, 0)
+        Write-Host "  Entries  : $($history.Count)  (spanning $spanDays days)" -ForegroundColor DarkGray
+        Write-Host "  Oldest   : $($history[0].Timestamp.ToString('yyyy-MM-dd'))  Health: $($history[0].HealthPct)%" -ForegroundColor DarkGray
+        Write-Host "  Newest   : $($history[-1].Timestamp.ToString('yyyy-MM-dd'))  Health: $($history[-1].HealthPct)%" -ForegroundColor DarkGray
+        $totalDrop = [math]::Round($history[0].HealthPct - $history[-1].HealthPct, 2)
+        if ($totalDrop -gt 0) {
+            Write-Host "  Degraded : $totalDrop% over $spanDays days" -ForegroundColor DarkGray
+        }
+        elseif ($totalDrop -le 0) {
+            Write-Host "  Degraded : No measurable degradation in recorded history" -ForegroundColor DarkGray
+        }
+
+        # Use cycle count from newest history entry as fallback when EC is unavailable
+        if ($null -eq $cycles -and $history[-1].CycleCount -gt 0) {
+            $cycles = $history[-1].CycleCount
+            Write-Host "  Cycle Count (from report): $cycles" -ForegroundColor DarkGray
+        }
+    }
+    elseif ($history -and $history.Count -eq 1) {
+        Write-Host "  Only 1 entry found — insufficient for slope calculation." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  No capacity history available (powercfg report returned no entries)." -ForegroundColor Yellow
+    }
+
     Write-Host ""
 
     # --- Run estimation ---
-    $estimate = Get-BatteryAgeEstimate -CycleCount $cycles -HealthPercent $health
+    $estimate = Get-BatteryAgeEstimate -CycleCount $cycles -HealthPercent $health -CapacityHistory $history
 
     if ($estimate.Confidence -eq "Unknown") {
         Write-Host "[ Age Estimation ]" -ForegroundColor Yellow
@@ -2171,6 +2595,9 @@ function BatteryAgeEstimation {
         }
         if ($estimate.HasCapacityData) {
             Write-Host "Capacity-based estimate  : ~$($estimate.CapacityBasedYears) year(s)"
+        }
+        if ($estimate.HasHistoryData) {
+            Write-Host "History-based estimate   : ~$($estimate.HistoryBasedYears) year(s)  ($($estimate.HistoryEntryCount) entries, $($estimate.HistorySpanDays) days)"
         }
 
         Write-Host ""
@@ -3081,6 +3508,181 @@ function Get-SafeWmiProperty {
     return $DefaultValue
 }
 
+function Format-PassFail {
+    <#
+    .SYNOPSIS
+    Writes a labelled metric line with a colour-coded PASS / WARN / FAIL badge.
+
+    Parameters
+      Label   — left-hand column label (padded to 22 chars)
+      Value   — the raw value string to display
+      Status  — "PASS", "WARN", or "FAIL"
+      Indent  — optional leading spaces (default "  ")
+    #>
+    param(
+        [string]$Label,
+        [string]$Value,
+        [ValidateSet("PASS","WARN","FAIL","INFO")]
+        [string]$Status = "INFO",
+        [string]$Indent = "  "
+    )
+    $badgeColor = switch ($Status) {
+        "PASS" { "Green"  }
+        "WARN" { "Yellow" }
+        "FAIL" { "Red"    }
+        "INFO" { "DarkGray" }
+    }
+    $badge = switch ($Status) {
+        "PASS" { "✔ PASS" }
+        "WARN" { "⚠ WARN" }
+        "FAIL" { "✘ FAIL" }
+        "INFO" { "  INFO" }
+    }
+    $labelPadded = $Label.PadRight(22)
+    Write-Host "$Indent$labelPadded : $Value" -NoNewline
+    Write-Host "  [$badge]" -ForegroundColor $badgeColor
+}
+
+function Get-DeploymentReadiness {
+    <#
+    .SYNOPSIS
+    Evaluates whether this ThinkPad meets deployment / resale readiness criteria
+    and returns a structured result object.
+
+    Checks performed:
+      Battery health >= 80%           PASS / FAIL
+      Cycle count < 500               PASS / WARN (>300) / FAIL (>=500)
+      No critical battery status       PASS / FAIL
+      Memory speed matched             PASS / WARN
+      BIOS not unknown                 PASS / WARN
+      No shock/thermal alerts (CDRT)   PASS / WARN / INFO (if unavailable)
+
+    Returns a PSCustomObject with:
+      Ready       — $true if all hard checks pass
+      Status      — "READY" / "REVIEW NEEDED" / "NOT READY"
+      StatusColor — console colour
+      Checks      — ordered hashtable of individual check results
+    #>
+
+    $checks  = [ordered]@{}
+    $hardFail = $false
+
+    # ── Battery health ───────────────────────────────────────────────────
+    $battPct  = $null
+    $battFail = $false
+    try {
+        # Prefer Lenovo_Battery, fall back to ACPI
+        if ((Test-LenovoNamespace) -and (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Battery")) {
+            $lbs = @(Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Battery -ErrorAction Stop)
+            $healths = @()
+            foreach ($lb in $lbs) {
+                $dcStr = ((Get-SafeWmiProperty -Object $lb -PropertyName "DesignCapacity") -replace '[^0-9,\.]','') -replace ',','.'
+                $fcStr = ((Get-SafeWmiProperty -Object $lb -PropertyName "FullChargeCapacity") -replace '[^0-9,\.]','') -replace ',','.'
+                [double]$dc = 0; [double]$fc = 0
+                if ([double]::TryParse($dcStr,[System.Globalization.NumberStyles]::Any,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$dc) -and
+                    [double]::TryParse($fcStr,[System.Globalization.NumberStyles]::Any,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$fc) -and
+                    $dc -gt 0) { $healths += [math]::Round(($fc/$dc)*100,1) }
+            }
+            if ($healths.Count -gt 0) { $battPct = ($healths | Measure-Object -Minimum).Minimum }
+        }
+        if ($null -eq $battPct) {
+            $acpi = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
+            $healths = @()
+            for ($i = 0; $i -lt $acpi.Count; $i++) {
+                $fc = $acpi[$i].FullChargedCapacity
+                $dc = Get-DesignCapacity -Index $i
+                [int64]$fcN = 0; [int64]$dcN = 0
+                if ($fc -and $dc -and [int64]::TryParse($fc.ToString(),[ref]$fcN) -and [int64]::TryParse($dc.ToString(),[ref]$dcN) -and $dcN -gt 0) {
+                    $healths += [math]::Round(($fcN/$dcN)*100,1)
+                }
+            }
+            if ($healths.Count -gt 0) { $battPct = ($healths | Measure-Object -Minimum).Minimum }
+        }
+    } catch {}
+
+    if ($null -ne $battPct) {
+        $battStatus = if ($battPct -ge 80) { "PASS" } elseif ($battPct -ge 70) { "WARN" } else { "FAIL" }
+        if ($battStatus -eq "FAIL") { $hardFail = $true }
+        $checks["Battery Health"] = [PSCustomObject]@{ Value = "$battPct%"; Status = $battStatus }
+    } else {
+        $checks["Battery Health"] = [PSCustomObject]@{ Value = "Unavailable"; Status = "WARN" }
+    }
+
+    # ── Cycle count ──────────────────────────────────────────────────────
+    $cycles = $null
+    try {
+        if (Test-LenovoNamespace) {
+            $odo = Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo -ClassName Lenovo_Odometer -ErrorAction Stop
+            [int64]$c = 0
+            if ([int64]::TryParse(([string]$odo.Battery_cycles -replace '\D',''),[ref]$c)) { $cycles = $c }
+        }
+    } catch {}
+
+    if ($null -ne $cycles) {
+        $cycleStatus = if ($cycles -lt 300) { "PASS" } elseif ($cycles -lt 500) { "WARN" } else { "FAIL" }
+        if ($cycleStatus -eq "FAIL") { $hardFail = $true }
+        $checks["Cycle Count"] = [PSCustomObject]@{ Value = "$cycles cycles"; Status = $cycleStatus }
+    } else {
+        $checks["Cycle Count"] = [PSCustomObject]@{ Value = "Unavailable"; Status = "INFO" }
+    }
+
+    # ── Memory ───────────────────────────────────────────────────────────
+    try {
+        $mem = Get-MemoryState
+        if ($mem.ModuleCount -gt 0) {
+            $memStatus = if ($mem.SpeedMismatch) { "WARN" } else { "PASS" }
+            $checks["Memory"] = [PSCustomObject]@{ Value = "$($mem.TotalRAMGB) GB  ($($mem.ModuleCount) module(s))"; Status = $memStatus }
+        } else {
+            $checks["Memory"] = [PSCustomObject]@{ Value = "Unavailable"; Status = "INFO" }
+        }
+    } catch {
+        $checks["Memory"] = [PSCustomObject]@{ Value = "Unavailable"; Status = "INFO" }
+    }
+
+    # ── BIOS ─────────────────────────────────────────────────────────────
+    $si = Get-SystemInfo
+    $biosStatus = if ($si.BIOSVersion -ne "Unknown") { "PASS" } else { "WARN" }
+    $checks["BIOS"] = [PSCustomObject]@{ Value = "$($si.BIOSVersion)  ($($si.BIOSDate))"; Status = $biosStatus }
+
+    # ── CDRT shock/thermal (if available) ────────────────────────────────
+    $cdrt = Get-CdrtOdometerData
+    if ($cdrt.Available) {
+        $shockStatus = if     ($null -eq $cdrt.ShockEvents)   { "INFO" }
+                       elseif ($cdrt.ShockEvents -le 20000)   { "PASS" }
+                       elseif ($cdrt.ShockEvents -le 60000)   { "WARN" }
+                       else                                    { "WARN" }
+        $checks["Shock Events"] = [PSCustomObject]@{
+            Value  = if ($null -ne $cdrt.ShockEvents) { "$($cdrt.ShockEvents)" } else { "N/A" }
+            Status = $shockStatus
+        }
+
+        $thermalStatus = if     ($null -eq $cdrt.ThermalEvents)  { "INFO" }
+                         elseif ($cdrt.ThermalEvents -le 50)     { "PASS" }
+                         elseif ($cdrt.ThermalEvents -le 200)    { "WARN" }
+                         else                                     { "WARN" }
+        $checks["Thermal Events"] = [PSCustomObject]@{
+            Value  = if ($null -ne $cdrt.ThermalEvents) { "$($cdrt.ThermalEvents)" } else { "N/A" }
+            Status = $thermalStatus
+        }
+    } else {
+        $checks["Shock / Thermal"] = [PSCustomObject]@{ Value = "Vantage not installed — skipped"; Status = "INFO" }
+    }
+
+    # ── Overall verdict ──────────────────────────────────────────────────
+    $anyWarn = $checks.Values | Where-Object { $_.Status -eq "WARN" }
+    $status  = if ($hardFail)        { "NOT READY"     }
+               elseif ($anyWarn)     { "REVIEW NEEDED" }
+               else                  { "READY"         }
+    $statusColor = if ($hardFail) { "Red" } elseif ($anyWarn) { "Yellow" } else { "Green" }
+
+    return [PSCustomObject]@{
+        Ready       = (-not $hardFail)
+        Status      = $status
+        StatusColor = $statusColor
+        Checks      = $checks
+    }
+}
+
 function Get-MemoryState {
     <#
     .SYNOPSIS
@@ -3250,6 +3852,36 @@ New-ScriptCimSession
 # This runs silently in the background — the result is surfaced in Show-Header
 # and the main menu so reactive users see the alert the moment they open the script.
 $null = Get-BatteryAlertState
+
+# Silently append a health snapshot to the persistent trend log.
+# Duplicate suppression inside the function prevents multiple entries per day.
+Write-BatteryTrendLog
+
+# ── One-time welcome notice ───────────────────────────────────────────────
+# Shown only on the very first launch (flag file written to %TEMP% afterward).
+# Gives first-time users immediate context on what this tool does and why
+# battery health matters — without interrupting repeat users at all.
+$welcomeFlag = "$env:TEMP\ThinkPadUtil_Notice.flag"
+if (-not (Test-Path $welcomeFlag)) {
+    Clear-Host
+    Write-Host "===============================================" -ForegroundColor Cyan
+    Write-Host "  Welcome to ThinkPad Utility Management" -ForegroundColor Cyan
+    Write-Host "===============================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "This tool surfaces hardware and battery information that Windows"
+    Write-Host "doesn't easily show — pulled directly from your ThinkPad's firmware"
+    Write-Host "and Lenovo EC (Embedded Controller) WMI interface."
+    Write-Host ""
+    Write-Host "Most importantly: check battery health early." -ForegroundColor Yellow
+    Write-Host "Degraded batteries cause short runtime, sudden shutdowns,"
+    Write-Host "and in severe cases, swelling or safety risk."
+    Write-Host ""
+    Write-Host "→ If your ThinkPad feels like it dies too fast, start with options 1–5." -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Press ENTER to continue..."
+    Read-Host | Out-Null
+    "seen" | Out-File $welcomeFlag -Encoding ascii
+}
 
 
 function Show-ErrorLog {
@@ -3891,8 +4523,37 @@ function Show-BiosUpdateCheck {
     }
 
     Write-Host ""
-    Write-Host "Note: Version comparison is string-based. If the format differs" -ForegroundColor DarkGray
-    Write-Host "      between installed and catalog, check the dates manually." -ForegroundColor DarkGray
+    Write-Host "Note: Version comparison uses numeric extraction where possible." -ForegroundColor DarkGray
+    Write-Host "      If the format is unrecognised, check the dates manually." -ForegroundColor DarkGray
+    Write-Host ""
+    Read-Host "Press ENTER"
+}
+
+function Show-DeploymentReadiness {
+    Show-Header
+    Write-Host "[ DEPLOYMENT READINESS CHECK ]"
+    Write-Host ""
+    Write-Host "Evaluating device against deployment criteria..." -ForegroundColor Cyan
+    Write-Host ""
+
+    $dr = Get-DeploymentReadiness
+
+    Write-Host ("-" * 50) -ForegroundColor DarkGray
+    foreach ($key in $dr.Checks.Keys) {
+        $chk = $dr.Checks[$key]
+        Format-PassFail -Label $key -Value $chk.Value -Status $chk.Status
+    }
+    Write-Host ("-" * 50) -ForegroundColor DarkGray
+    Write-Host ""
+
+    Write-Host "  Deployment Status : " -NoNewline
+    Write-Host $dr.Status -ForegroundColor $dr.StatusColor
+
+    Write-Host ""
+    Write-Host "Criteria:" -ForegroundColor DarkGray
+    Write-Host "  PASS  Battery >= 80%,  Cycles < 300,  Memory matched" -ForegroundColor DarkGray
+    Write-Host "  WARN  Battery 70–79%,  Cycles 300–499,  Memory mismatch" -ForegroundColor DarkGray
+    Write-Host "  FAIL  Battery < 70%,   Cycles >= 500" -ForegroundColor DarkGray
     Write-Host ""
     Read-Host "Press ENTER"
 }
@@ -3900,17 +4561,17 @@ function Show-BiosUpdateCheck {
 do {
     Show-Header
 
-    # ── Guided-mode auto-prompt (#3) ─────────────────────────────────────
+    # ── Guided-mode auto-prompt (#5) ─────────────────────────────────────
     # After the user has browsed the menu 2 times without selecting a battery
-    # option, and any battery is degraded (Severity >= 1), gently surface the
-    # Comprehensive Battery Analysis once. Fires only once per session so it
-    # never becomes intrusive to power users.
+    # option, and any battery is critically degraded (Severity >= 3), gently
+    # surface the Comprehensive Battery Analysis once. Fires only once per
+    # session so it never becomes intrusive to power users.
     $script:MenuLoopCount++
     if (-not $script:GuidedAnalysisShown -and
         $script:MenuLoopCount -ge 2 -and
         $script:BatteryAlert -and
         $script:BatteryAlert.Available -and
-        $script:BatteryAlert.WorstSeverity -ge 1) {
+        $script:BatteryAlert.WorstSeverity -ge 3) {
 
         $script:GuidedAnalysisShown = $true
         $guideColor = switch ($script:BatteryAlert.WorstSeverity) {
@@ -3931,7 +4592,7 @@ do {
     }
 
     # Build alert suffix for battery-related menu items
-    # Shown next to Options 4 and 5 when any battery is Fair, Poor, or Critical
+    # Shown next to battery options when any battery is degraded
     $alertSuffix = ""
     $alertColor  = "White"
     if ($script:BatteryAlert -and $script:BatteryAlert.Available -and $script:BatteryAlert.WorstSeverity -ge 1) {
@@ -3940,6 +4601,14 @@ do {
             1 { "Cyan" }; 2 { "Yellow" }; 3 { "Magenta" }; 4 { "Red" }
             default { "White" }
         }
+    }
+
+    # ── Battery status banner above the menu ────────────────────────────
+    # Shows a colored summary line when any battery has Severity >= 1,
+    # so the alert is visible before the user even reads the menu.
+    if ($alertSuffix) {
+        Write-Host "Battery Status Alert: $($script:BatteryAlert.SummaryLine)" -ForegroundColor $alertColor
+        Write-Host ""
     }
 
     Write-Host "1. Battery Static Data"
@@ -3952,37 +4621,43 @@ do {
     Write-Host "6. Memory Info"
     Write-Host "7. Export Report"
     Write-Host "8. Diagnostic Info"
-    Write-Host "9. Battery Age Estimation"
+    Write-Host -NoNewline "9. Battery Age Estimation"
+    if ($alertSuffix) { Write-Host $alertSuffix -ForegroundColor $alertColor } else { Write-Host "" }
     Write-Host "10. Battery Charge Threshold"
     Write-Host "11. CDRT Odometer"
     Write-Host "12. About"
     Write-Host "13. Error Log Viewer"
     Write-Host "14. ThinkPad Health Score"
     Write-Host "15. BIOS Update Check"
-    Write-Host "16. Exit"
+    Write-Host -NoNewline "16. Battery Health Trend"
+    if ($alertSuffix) { Write-Host $alertSuffix -ForegroundColor $alertColor } else { Write-Host "" }
+    Write-Host "17. Deployment Readiness"
+    Write-Host "18. Exit"
     Write-Host ""
 
     $choice = Read-Host "Select option"
 
     switch ($choice) {
-        "1" { BatteryStaticData }
-        "2" { LenovoEC }
-        "3" { WarrantyInfo }
-        "4" { FullCharge }
-        "5" { ComprehensiveBatteryAnalysis }
-        "6" { MemoryInfo }
-        "7" { ExportReport }
-        "8" { DiagnosticInfo }
-        "9" { BatteryAgeEstimation }
+        "1"  { BatteryStaticData }
+        "2"  { LenovoEC }
+        "3"  { WarrantyInfo }
+        "4"  { FullCharge }
+        "5"  { ComprehensiveBatteryAnalysis }
+        "6"  { MemoryInfo }
+        "7"  { ExportReport }
+        "8"  { DiagnosticInfo }
+        "9"  { BatteryAgeEstimation }
         "10" { ChargeThresholdManager }
         "11" { Show-CdrtOdometer }
         "12" { Show-About }
         "13" { Show-ErrorLog }
         "14" { Show-ThinkPadHealthScore }
         "15" { Show-BiosUpdateCheck }
+        "16" { Show-BatteryHealthTrend }
+        "17" { Show-DeploymentReadiness }
     }
 
-} while ($choice -ne "16")
+} while ($choice -ne "18")
 
 # Tear down the shared CIM session cleanly before exiting.
 if ($script:CimSession) {
