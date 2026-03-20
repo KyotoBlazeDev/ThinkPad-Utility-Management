@@ -1,3 +1,5 @@
+<img width="282" height="131" alt="TUM_logo" src="https://github.com/user-attachments/assets/1896c0be-2ae6-413b-a2ed-bfa2ef3cd5ae" />
+
 # ThinkPad Utility Management
 Windows PowerShell diagnostic tool for ThinkPad hardware
 
