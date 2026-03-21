@@ -118,82 +118,6 @@ function New-ScriptCimSession {
     }
 }
 
-function Get-GenuineManufacturerList {
-    <#
-    .SYNOPSIS
-    Returns the list of known OEM battery manufacturer name tokens.
-
-    .DESCRIPTION
-    DEPRECATED — no longer used as a pass/fail gate in Get-BatteryClassification.
-
-    Historical context: This function was introduced when Lenovo actively enforced
-    a battery whitelist via BIOS firmware (circa 2016), blocking third-party cells
-    from charging. The "non-genuine" warning was intended to surface that lockdown
-    to users.
-
-    As of EU Battery Regulation (Regulation (EU) 2023/1542, effective Feb 18 2027),
-    consumers have an explicit legal right to replace batteries with third-party
-    cells. Treating a non-OEM manufacturer name as a WARN or FAIL condition is
-    therefore inappropriate in an EU-facing tool.
-
-    This function is retained for reference and potential informational display
-    but must not be used to produce warnings, failures, or any output implying
-    a third-party battery is unsafe or non-compliant.
-
-    Scheduled for full removal in a future cleanup pass post-v2.0 release.
-
-    .NOTES
-    v2.0 — Deprecated. See GitHub Issue #1 (EU Compliance milestone).
-    #>
-
-    # Built-in fallback list -- always used if JSON load fails for any reason
-    $builtIn = @(
-        "LENOVO",    # Lenovo-branded packs
-        "PANASONIC", # Historic OEM supplier (IBM/early Lenovo era)
-        "SANYO",     # Historic OEM supplier
-        "SONY",      # Historic OEM supplier
-        "MURATA",    # Sony battery division acquired by Murata in 2017
-        "LGC",       # LG Chem - common modern OEM supplier
-        "LG",        # LG Chem alternate short form reported by some firmware
-        "SDI",       # Samsung SDI
-        "SAMSUNG",   # Samsung SDI alternate form
-        "CELXPERT",  # Confirmed Lenovo-authorized supplier
-        "ATL",       # Amperex Technology Limited
-        "COSMX",     # Authorized supplier
-        "BYD",       # BYD battery division
-        "NVT",       # Authorized supplier
-        "SUNWODA",   # Confirmed Lenovo-authorized supplier
-        "SMP"        # Authorized supplier
-    )
-
-    # Resolve JSON path relative to this script file
-    $jsonPath = Join-Path $PSScriptRoot "manufacturers.json"
-
-    if (-not (Test-Path $jsonPath)) {
-        return $builtIn
-    }
-
-    try {
-        $data = Get-Content -Path $jsonPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-
-        $names = @($data.genuineManufacturers |
-                   Where-Object { $_.name -and $_.name.Trim() -ne "" } |
-                   Select-Object -ExpandProperty name)
-
-        if ($names.Count -gt 0) {
-            return $names
-        }
-        else {
-            Write-Warning "manufacturers.json contained no valid entries -- using built-in manufacturer list."
-            return $builtIn
-        }
-    }
-    catch {
-        Write-Warning "Failed to load manufacturers.json ($($_.Exception.Message)) -- using built-in manufacturer list."
-        return $builtIn
-    }
-}
-
 function Get-BatteryClassification {
     param(
         [object]$DesignCapacity,
@@ -215,7 +139,6 @@ function Get-BatteryClassification {
     $HealthPercent = 0
     $Classification = "Unknown"
     $Severity = 3
-    $IsGenuine = $true
     $FailureFlag = $false
     $Message = ""
 
@@ -243,20 +166,11 @@ function Get-BatteryClassification {
                 HealthPercent  = $HealthPercent
                 Classification = $Classification
                 Severity       = $Severity
-                IsGenuine      = $IsGenuine
                 FailureFlag    = $FailureFlag
                 Message        = $Message
             }
         }
     }
-
-    # DEPRECATED (v2.0 — EU Compliance): Manufacturer allowlist check removed.
-    # Get-GenuineManufacturerList was previously used here to flag third-party
-    # batteries as non-genuine. Under EU Battery Regulation (effective Feb 18 2027)
-    # this is no longer appropriate — third-party replacements are a consumer right.
-    # $IsGenuine is preserved as $true to suppress legacy warning display sites
-    # that have not yet been removed. See GitHub Issue #1.
-    $IsGenuine = $true
 
     # Parse cycle count
     [int64]$cycles = 0
@@ -306,18 +220,12 @@ function Get-BatteryClassification {
         $Message = "Battery health is good."
     }
 
-    # Add genuineness warning to message
-    if (-not $IsGenuine) {
-        # DEPRECATED (v2.0): Non-genuine warning message suppressed — EU Battery Regulation compliance.
-    }
-
     return [PSCustomObject]@{
-        HealthPercent = $HealthPercent
+        HealthPercent  = $HealthPercent
         Classification = $Classification
-        Severity = $Severity
-        IsGenuine = $IsGenuine
-        FailureFlag = $FailureFlag
-        Message = $Message
+        Severity       = $Severity
+        FailureFlag    = $FailureFlag
+        Message        = $Message
     }
 }
 
@@ -1153,7 +1061,6 @@ function FullCharge {
                         Write-Host "  Summary              : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
 
-                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
                         if ($classification.FailureFlag) {
                             Write-Host "  ALERT: Battery replacement needed immediately!" -ForegroundColor Red
                         }
@@ -1239,7 +1146,6 @@ function FullCharge {
                         Write-Host "Summary              : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
 
-                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
                         if ($classification.FailureFlag) {
                             Write-Host "ALERT: Battery replacement needed immediately!" -ForegroundColor Red
                         }
@@ -1445,7 +1351,6 @@ function ComprehensiveBatteryAnalysis {
                         Write-Host "Summary              : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
                         
-                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
                         
                         if ($classification.FailureFlag) {
                             Write-Host "ALERT: Battery replacement needed immediately!" -ForegroundColor Red
@@ -1508,7 +1413,6 @@ function ComprehensiveBatteryAnalysis {
                         Write-Host $classification.Classification -ForegroundColor $severityColor
                         Write-Host "Status           : $status"
                         
-                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
                         
                         Write-Host ""
                     }
@@ -1740,7 +1644,6 @@ function ExportReport {
                         $Report += "  Manufacturer   : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })"
                         $Report += "  Health         : $($classification.HealthPercent)%"
                         $Report += "  Rating         : $($classification.Classification)"
-                        # DEPRECATED (v2.0): Genuine field removed from report — EU Battery Regulation compliance.
                         $Report += "  Manufacturer   : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })  [INFO]"
                         $Report += "  Summary        : $($classification.Message)"
                         $Report += ""
@@ -1808,6 +1711,89 @@ function ExportReport {
     Read-Host "Press ENTER"
 }
 
+function Get-LenovoConfigPath {
+    Join-Path $env:LOCALAPPDATA "LenovoUtility\config.json"
+}
+
+function Get-TrendLogInterval {
+    <#
+    .SYNOPSIS
+    Returns the user-configured trend log interval as a TimeSpan.
+    On first run, prompts the user to set it and saves to config.json.
+    Falls back to prompting again if the config is missing or corrupt.
+    #>
+    $configPath = Get-LenovoConfigPath
+    $defaultTs  = [TimeSpan]::FromHours(24)
+
+    # Try to load existing config
+    if (Test-Path $configPath) {
+        try {
+            $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+            if ($cfg.TrendLogInterval) {
+                $ts = [TimeSpan]::Zero
+                if ([TimeSpan]::TryParse($cfg.TrendLogInterval, [ref]$ts)) {
+                    return $ts
+                }
+            }
+        } catch {}
+    }
+
+    # First run or corrupt — prompt user
+    Write-Host ""
+    Write-Host "===============================================" -ForegroundColor Cyan
+    Write-Host "  BATTERY TREND LOG — FIRST-TIME SETUP"        -ForegroundColor Cyan
+    Write-Host "===============================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  How often should the script log a battery snapshot?" -ForegroundColor White
+    Write-Host "  Enter an interval in HH:MM:SS format."              -ForegroundColor DarkGray
+    Write-Host "  Examples:  24:00:00  (once a day)"                  -ForegroundColor DarkGray
+    Write-Host "             12:00:00  (twice a day)"                 -ForegroundColor DarkGray
+    Write-Host "             06:00:00  (every 6 hours)"               -ForegroundColor DarkGray
+    Write-Host ""
+
+    while ($true) {
+        $rawInput = (Read-Host "  Interval [HH:MM:SS]").Trim()
+        if ([string]::IsNullOrWhiteSpace($rawInput)) {
+            Write-Host "  Using default: 24:00:00" -ForegroundColor DarkGray
+            $ts = $defaultTs
+            break
+        }
+        $ts = [TimeSpan]::Zero
+        if ([TimeSpan]::TryParse($rawInput, [ref]$ts) -and $ts.TotalMinutes -ge 1) {
+            break
+        }
+        Write-Host "  Invalid format — please enter HH:MM:SS (minimum 00:01:00)." -ForegroundColor Red
+    }
+
+    Set-TrendLogInterval -Interval $ts
+    return $ts
+}
+
+function Set-TrendLogInterval {
+    param([TimeSpan]$Interval)
+
+    $configPath = Get-LenovoConfigPath
+    $configDir  = Split-Path $configPath
+
+    if (-not (Test-Path $configDir)) {
+        New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+    }
+
+    # Merge with existing config so other keys are preserved
+    $cfg = [ordered]@{}
+    if (Test-Path $configPath) {
+        try {
+            $existing = Get-Content $configPath -Raw | ConvertFrom-Json
+            foreach ($prop in $existing.PSObject.Properties) {
+                $cfg[$prop.Name] = $prop.Value
+            }
+        } catch {}
+    }
+
+    $cfg["TrendLogInterval"] = $Interval.ToString("hh\:mm\:ss")
+    $cfg | ConvertTo-Json -Depth 5 | Set-Content $configPath -Encoding UTF8
+}
+
 function Write-BatteryTrendLog {
     <#
     .SYNOPSIS
@@ -1822,8 +1808,10 @@ function Write-BatteryTrendLog {
              HealthPct, CycleCount
 
     Duplicate suppression: if the most recent entry for a given BatteryIndex
-    was written within the last 20 hours, the row is skipped — so rapid
-    successive runs (e.g. testing) don't inflate the log.
+    Duplicate suppression: if the most recent entry for a given BatteryIndex
+    was written within the user-configured interval (stored in config.json),
+    the row is skipped — so rapid successive runs (e.g. testing) don't inflate
+    the log. The interval is set on first run and adjustable from the trend view.
     #>
 
     try {
@@ -1841,6 +1829,7 @@ function Write-BatteryTrendLog {
         }
 
         $now = Get-Date
+        $logInterval = Get-TrendLogInterval
 
         # Collect per-battery data from ACPI (always available, source-agnostic)
         $acpiBatteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
@@ -1897,7 +1886,7 @@ function Write-BatteryTrendLog {
                     if ($cachedID -and $cachedID -ne "Unavailable") { $batteryID = $cachedID }
                 }
 
-                # Duplicate suppression — skip if logged within last 20 hours for this index
+                # Duplicate suppression — skip if logged within user-configured interval
                 $recentEntry = $existing |
                     Where-Object { $_.BatteryIndex -eq $i } |
                     Sort-Object Timestamp |
@@ -1906,7 +1895,7 @@ function Write-BatteryTrendLog {
                 if ($recentEntry) {
                     try {
                         $lastTime = [datetime]::Parse($recentEntry.Timestamp)
-                        if (($now - $lastTime).TotalHours -lt 20) { continue }
+                        if (($now - $lastTime) -lt $logInterval) { continue }
                     } catch {}
                 }
 
@@ -1971,6 +1960,22 @@ function Show-BatteryHealthTrend {
     }
 
     $indices = $rows | Select-Object -ExpandProperty BatteryIndex -Unique | Sort-Object
+
+    # Show 'Trend log available' banner if at least one battery has 2+ entries
+    $hasTrendData = $false
+    foreach ($idx in $indices) {
+        if (($rows | Where-Object { $_.BatteryIndex -eq $idx }).Count -ge 2) {
+            $hasTrendData = $true
+            break
+        }
+    }
+    if ($hasTrendData) {
+        Write-Host "-----------------------------------------------" -ForegroundColor Green
+        Write-Host "  Trend log available — degradation analysis" -ForegroundColor Green
+        Write-Host "  ready below." -ForegroundColor Green
+        Write-Host "-----------------------------------------------" -ForegroundColor Green
+        Write-Host ""
+    }
 
     foreach ($idx in $indices) {
         $battRows = @($rows | Where-Object { $_.BatteryIndex -eq $idx } | Sort-Object Timestamp)
@@ -2058,9 +2063,33 @@ function Show-BatteryHealthTrend {
         Write-Host ""
     }
 
-    Write-Host "Saved to: $logPath" -ForegroundColor DarkGray
+    $currentInterval = Get-TrendLogInterval
+    Write-Host "Saved to        : $logPath" -ForegroundColor DarkGray
+    Write-Host "Log interval    : $($currentInterval.ToString('hh\:mm\:ss'))  (HH:MM:SS)" -ForegroundColor DarkGray
     Write-Host ""
-    Read-Host "Press ENTER"
+    Write-Host "  [C] Change interval    [ENTER] Back" -ForegroundColor DarkGray
+    Write-Host ""
+    $choice = (Read-Host "  Choice").Trim().ToUpper()
+
+    if ($choice -eq "C") {
+        Write-Host ""
+        Write-Host "  Enter new interval in HH:MM:SS format." -ForegroundColor White
+        Write-Host "  Examples:  24:00:00  /  12:00:00  /  06:00:00" -ForegroundColor DarkGray
+        Write-Host ""
+        while ($true) {
+            $rawInput = (Read-Host "  New interval [HH:MM:SS]").Trim()
+            $ts = [TimeSpan]::Zero
+            if ([TimeSpan]::TryParse($rawInput, [ref]$ts) -and $ts.TotalMinutes -ge 1) {
+                Set-TrendLogInterval -Interval $ts
+                Write-Host ""
+                Write-Host "  v Interval updated to $($ts.ToString('hh\:mm\:ss'))" -ForegroundColor Green
+                Write-Host ""
+                break
+            }
+            Write-Host "  Invalid — please enter HH:MM:SS (minimum 00:01:00)." -ForegroundColor Red
+        }
+        Read-Host "  Press ENTER"
+    }
 }
 
 function Get-BatteryCapacityHistory {
@@ -2555,7 +2584,7 @@ function Test-CommercialVantage {
     # Strategy 3: Commercial Vantage service presence.
     try {
         $svc = Get-Service -Name "LenovoVantageService" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Status -ne $null } |
+            Where-Object { $null -ne $_.Status } |
             Select-Object -First 1
         if ($svc) { return $true }
     } catch {}
@@ -2618,7 +2647,7 @@ function Test-SifInstalled {
     # Strategy 3: SIF service presence.
     try {
         $svc = Get-Service -Name "ImControllerService","sifservice" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Status -ne $null } |
+            Where-Object { $null -ne $_.Status } |
             Select-Object -First 1
         if ($svc) { return $true }
     } catch {}

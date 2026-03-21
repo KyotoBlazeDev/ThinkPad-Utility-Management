@@ -22,7 +22,7 @@
       "DocumentGroups": [
         {
           "DockedWidth": 200,
-          "SelectedChildIndex": 4,
+          "SelectedChildIndex": 3,
           "Children": [
             {
               "$type": "Bookmark",
@@ -37,10 +37,6 @@
               "Name": "ST:128:0:{1fc202d4-d401-403c-9834-5b218574bb67}"
             },
             {
-              "$type": "Bookmark",
-              "Name": "ST:0:0:{1c4feeaa-4718-4aa9-859d-94ce25d182ba}"
-            },
-            {
               "$type": "Document",
               "DocumentIndex": 0,
               "Title": "README.md",
@@ -48,7 +44,7 @@
               "RelativeDocumentMoniker": "README.md",
               "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\README.md",
               "RelativeToolTip": "README.md",
-              "ViewState": "AgIAALwBAAAAAAAAAAAuwM0BAAAZAAAAAAAAAA==",
+              "ViewState": "AgIAAIcBAAAAAAAAAAAAAI8BAABGAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001818|",
               "WhenOpened": "2026-03-21T08:00:04.328Z",
               "EditorCaption": ""
