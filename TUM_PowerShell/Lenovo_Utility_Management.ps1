@@ -708,7 +708,7 @@ function Show-Header {
     $si  = Get-SystemInfo
     $sto = Get-StorageInfo
     Write-Host "==============================================="
-    Write-Host "  LENOVO DEVICE HEALTH CHECK  V.1.1"
+    Write-Host "      LENOVO DEVICE HEALTH CHECK  V.1.1.2"
     Write-Host "==============================================="
     Write-Host "Device  : $env:COMPUTERNAME"
     Write-Host "Model   : $($si.Model)"
@@ -2455,7 +2455,7 @@ function Show-About {
     Write-Host ""
 
     Write-Host "Lenovo Device Health Check" -ForegroundColor Cyan
-    Write-Host "Version 1.1" -ForegroundColor White
+    Write-Host "Version 1.1.2" -ForegroundColor White
     Write-Host ""
 
     Write-Host "Built with Windows PowerShell, ChatGPT GPT 5.4, and Claude Sonnet 4.6" -ForegroundColor DarkGray

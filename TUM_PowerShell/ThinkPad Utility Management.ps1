@@ -702,7 +702,7 @@ function Show-Header {
     Clear-Host
     $si = Get-SystemInfo
     Write-Host "==============================================="
-    Write-Host "  THINKPAD UTILITY MANAGEMENT DASHBOARD V.1.2"
+    Write-Host " THINKPAD UTILITY MANAGEMENT DASHBOARD V.1.1.2"
     Write-Host "==============================================="
 
     # ── [ SYSTEM INFO ] ──────────────────────────────────────────────────
@@ -3007,7 +3007,7 @@ function Show-About {
 
     # Version & build
     Write-Host "ThinkPad Utility Management" -ForegroundColor Cyan
-    Write-Host "Version 1.1" -ForegroundColor White
+    Write-Host "Version 1.1.2" -ForegroundColor White
     Write-Host ""
 
     # Built with
