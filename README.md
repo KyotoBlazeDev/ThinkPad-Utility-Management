@@ -398,3 +398,65 @@ This project is not affiliated with or endorsed by Lenovo. ThinkPad is a tradema
 Provided for educational and diagnostic purposes only. This script makes no modifications to system configuration, firmware, or settings outside of the explicit charge threshold write in Option 10, which requires deliberate user confirmation. Battery age estimation results are statistical approximations. Actual age may vary based on usage habits, temperature, and service history.
 
 Built with Windows PowerShell, ChatGPT GPT 5.4, and Claude Sonnet 4.6.
+
+## EU Battery Regulation Compliance
+ 
+This tool is designed in compliance with **Regulation (EU) 2023/1542**, effective
+**18 February 2027**, which establishes consumer rights around portable battery
+replacement and access to battery health information.
+ 
+### Background: the Lenovo battery lockdown
+ 
+From approximately 2016, certain Lenovo and ThinkPad devices enforced a **battery
+manufacturer whitelist via BIOS firmware**. Batteries from manufacturers not present
+on the allowlist were flagged as non-genuine and, in some configurations, blocked
+from charging. Diagnostic software that surfaced this whitelist check — including
+earlier versions of this tool — would emit warnings such as "non-genuine battery
+detected" for third-party replacement cells.
+ 
+Under EU Battery Regulation, this behaviour is no longer appropriate. Consumers
+have an **explicit legal right** to replace portable batteries with third-party
+cells. Treating a non-OEM manufacturer name as a warning or failure condition
+conflicts with that right and was removed in **v2.0** of this tool.
+ 
+### What changed in v2.0
+ 
+- **Manufacturer allowlist check removed as a pass/fail gate.** The function
+  `Get-GenuineManufacturerList` is retained for informational display only
+  (e.g. identifying a known OEM supplier) but produces no warnings, failures,
+  or output implying a third-party battery is unsafe or non-compliant.
+- **Non-genuine warning suppressed across all battery functions.** Four
+  separate call sites previously capable of emitting a non-genuine warning
+  have been updated with `# DEPRECATED (v2.0): Non-genuine warning removed —
+  EU Battery Regulation compliance.`
+- **Serial/barcode mismatch detection** replaces manufacturer gating in the
+  deployment readiness workflow. A mismatched serial is a legitimate data
+  integrity concern; a non-OEM manufacturer name is not.
+ 
+### Battery health data access
+ 
+The EU regulation also requires that consumers have access to battery health
+information sufficient to make informed replacement decisions. This tool
+surfaces the following data points directly from Windows WMI and ACPI
+interfaces, without relying on Lenovo Vantage or any OEM software:
+ 
+- Full charge capacity vs. design capacity (health percentage)
+- Cycle count (where available via `root\Lenovo` or `Lenovo_Odometer`)
+- Battery temperature with severity classification
+- Degradation rate and projected time to 80% replacement threshold
+- Persistent trend log with configurable logging interval
+ 
+The 80% threshold used for replacement advisories aligns with the level at
+which the EU regulation considers a battery to have reached end of useful life
+for consumer purposes.
+ 
+### Regulation reference
+ 
+> Regulation (EU) 2023/1542 of the European Parliament and of the Council
+> of 12 July 2023 concerning batteries and waste batteries.
+> OJ L 191, 28.7.2023, p. 1–117.
+> Effective date for portable battery replaceability requirements: 18 February 2027.
+ 
+This tool makes no modifications to system firmware, BIOS settings, or Windows
+configuration. It is a read-only diagnostic utility. Nothing in this tool
+constitutes legal advice.

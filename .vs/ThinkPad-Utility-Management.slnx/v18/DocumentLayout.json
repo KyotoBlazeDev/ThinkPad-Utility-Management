@@ -3,12 +3,12 @@
   "WorkspaceRootPath": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\",
   "Documents": [
     {
-      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\Lenovo_Utility_Management.ps1||{3B902123-F8A7-4915-9F01-361F908088D0}",
-      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:TUM_PowerShell\\Lenovo_Utility_Management.ps1||{3B902123-F8A7-4915-9F01-361F908088D0}"
-    },
-    {
       "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\ThinkPad Utility Management.ps1||{3B902123-F8A7-4915-9F01-361F908088D0}",
       "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:TUM_PowerShell\\ThinkPad Utility Management.ps1||{3B902123-F8A7-4915-9F01-361F908088D0}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\Lenovo_Utility_Management.ps1||{3B902123-F8A7-4915-9F01-361F908088D0}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:TUM_PowerShell\\Lenovo_Utility_Management.ps1||{3B902123-F8A7-4915-9F01-361F908088D0}"
     }
   ],
   "DocumentGroupContainers": [
@@ -18,7 +18,7 @@
       "DocumentGroups": [
         {
           "DockedWidth": 200,
-          "SelectedChildIndex": 4,
+          "SelectedChildIndex": 5,
           "Children": [
             {
               "$type": "Bookmark",
@@ -38,26 +38,26 @@
             },
             {
               "$type": "Document",
-              "DocumentIndex": 0,
+              "DocumentIndex": 1,
               "Title": "Lenovo_Utility_Management.ps1",
               "DocumentMoniker": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\Lenovo_Utility_Management.ps1",
               "RelativeDocumentMoniker": "TUM_PowerShell\\Lenovo_Utility_Management.ps1",
               "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\Lenovo_Utility_Management.ps1",
               "RelativeToolTip": "TUM_PowerShell\\Lenovo_Utility_Management.ps1",
-              "ViewState": "AgIAALoNAAAAAAAAAAAAwMwNAAAXAAAAAAAAAA==",
+              "ViewState": "AgIAALQNAAAAAAAAAAAAwMYNAAAXAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
               "WhenOpened": "2026-03-21T03:16:19.47Z",
               "EditorCaption": ""
             },
             {
               "$type": "Document",
-              "DocumentIndex": 1,
+              "DocumentIndex": 0,
               "Title": "ThinkPad Utility Management.ps1",
               "DocumentMoniker": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\ThinkPad Utility Management.ps1",
               "RelativeDocumentMoniker": "TUM_PowerShell\\ThinkPad Utility Management.ps1",
               "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\ThinkPad Utility Management.ps1",
               "RelativeToolTip": "TUM_PowerShell\\ThinkPad Utility Management.ps1",
-              "ViewState": "AgIAADcSAAAAAAAAAAAAwEkSAAAXAAAAAAAAAA==",
+              "ViewState": "AgIAAOgLAAAAAAAAAAAIwEcSAAAXAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
               "WhenOpened": "2026-03-21T03:16:10.427Z",
               "EditorCaption": ""
