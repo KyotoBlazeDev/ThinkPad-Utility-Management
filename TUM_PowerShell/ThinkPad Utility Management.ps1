@@ -122,21 +122,32 @@ function New-ScriptCimSession {
 function Get-GenuineManufacturerList {
     <#
     .SYNOPSIS
-    Returns the list of genuine battery manufacturer name tokens used for
-    non-genuine detection in Get-BatteryClassification.
+    Returns the list of known OEM battery manufacturer name tokens.
 
     .DESCRIPTION
-    Tries to load the list from manufacturers.json in the same directory as
-    this script. If the file is missing, unreadable, or contains no entries,
-    falls back silently to the built-in hardcoded list so the script never
-    breaks due to a missing or malformed JSON file.
+    DEPRECATED — no longer used as a pass/fail gate in Get-BatteryClassification.
 
-    To extend detection without editing this script, add entries to the
-    genuineManufacturers array in manufacturers.json:
-      { "name": "NEWMFR", "fullName": "New Manufacturer Inc.", "region": "XX", "notes": "" }
+    Historical context: This function was introduced when Lenovo actively enforced
+    a battery whitelist via BIOS firmware (circa 2016), blocking third-party cells
+    from charging. The "non-genuine" warning was intended to surface that lockdown
+    to users.
 
-    The "name" field is matched case-insensitively as a substring against
-    BatteryStaticData.ManufactureName. Only the "name" field is required.
+    As of EU Battery Regulation (Regulation (EU) 2023/1542, effective Feb 18 2027),
+    consumers have an explicit legal right to replace batteries with third-party
+    cells. Treating a non-OEM manufacturer name as a WARN or FAIL condition is
+    therefore inappropriate in an EU-facing tool. Battery serial/barcode mismatch
+    detection (Get-BatterySerialMismatch in ThinkPad_DeploymentCheck.ps1) replaces
+    this approach for the deployment readiness workflow.
+
+    This function is retained for reference and potential informational display
+    (e.g. "Manufacturer: ATL — known OEM supplier") but must not be used to
+    produce warnings, failures, or any output implying a third-party battery
+    is unsafe or non-compliant.
+
+    Scheduled for full removal in a future cleanup pass post-v2.0 release.
+
+    .NOTES
+    v2.0 — Deprecated. See GitHub Issue #1 (EU Compliance milestone).
     #>
 
     # Built-in fallback list -- always used if JSON load fails for any reason
@@ -243,20 +254,13 @@ function Get-BatteryClassification {
         }
     }
 
-    # Detect non-genuine batteries
-    # Load manufacturer list from manufacturers.json (falls back to built-in list if missing)
-    $GenuineManufacturers = Get-GenuineManufacturerList
-    $IsGenuine = $false
-
-    if ($Manufacturer -and $Manufacturer -ne "Unknown" -and $Manufacturer -ne "N/A") {
-        $normalizedManufacturer = $Manufacturer.Trim().ToUpper()
-        foreach ($Genuine in $GenuineManufacturers) {
-            if ($normalizedManufacturer -match [regex]::Escape($Genuine.ToUpper())) {
-                $IsGenuine = $true
-                break
-            }
-        }
-    }
+    # DEPRECATED (v2.0 — EU Compliance): Manufacturer allowlist check removed.
+    # Get-GenuineManufacturerList was previously used here to flag third-party
+    # batteries as non-genuine. Under EU Battery Regulation (effective Feb 18 2027)
+    # this is no longer appropriate — third-party replacements are a consumer right.
+    # $IsGenuine is preserved as $true to suppress legacy warning display sites
+    # that have not yet been removed. See GitHub Issue #1.
+    $IsGenuine = $true
 
     # Parse cycle count
     [int64]$cycles = 0
@@ -306,10 +310,9 @@ function Get-BatteryClassification {
         $Message = "Battery health is good."
     }
 
-    # Add genuineness warning to message
-    if (-not $IsGenuine) {
-        $Message += " Warning: The battery in use is not genuine Lenovo-made or authorized. Lenovo has no responsibility for the performance or safety of unauthorized batteries, and provides no warranties for failure or damage arising from their use."
-    }
+    # DEPRECATED (v2.0): Non-genuine warning message suppressed.
+    # $IsGenuine is always $true — this block is inert and retained only until
+    # the IsGenuine field is fully removed from the return object in a future pass.
 
     return [PSCustomObject]@{
         HealthPercent = $HealthPercent
@@ -1266,9 +1269,7 @@ function FullCharge {
                         Write-Host "  Status               : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
 
-                        if (-not $classification.IsGenuine) {
-                            Write-Host "  WARNING: Non-genuine battery detected" -ForegroundColor Red
-                        }
+                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
                         if ($classification.FailureFlag) {
                             Write-Host "  ALERT: Battery replacement needed immediately!" -ForegroundColor Red
                         }
@@ -1356,9 +1357,7 @@ function FullCharge {
                         Write-Host "Status               : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
 
-                        if (-not $classification.IsGenuine) {
-                            Write-Host "WARNING: Non-genuine battery detected" -ForegroundColor Red
-                        }
+                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
                         if ($classification.FailureFlag) {
                             Write-Host "ALERT: Battery replacement needed immediately!" -ForegroundColor Red
                         }
@@ -1653,9 +1652,7 @@ function ComprehensiveBatteryAnalysis {
                         Write-Host "Status               : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
                         
-                        if (-not $classification.IsGenuine) {
-                            Write-Host "WARNING: Non-genuine battery detected" -ForegroundColor Red
-                        }
+                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
                         
                         if ($classification.FailureFlag) {
                             Write-Host "ALERT: Battery replacement needed immediately!" -ForegroundColor Red
@@ -1718,9 +1715,7 @@ function ComprehensiveBatteryAnalysis {
                         Write-Host $classification.Classification -ForegroundColor $severityColor
                         Write-Host "Battery Status      : $status"
                         
-                        if (-not $classification.IsGenuine) {
-                            Write-Host "WARNING: Non-genuine battery detected" -ForegroundColor Red
-                        }
+                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
                         
                         Write-Host ""
                     }
@@ -1751,9 +1746,22 @@ function ComprehensiveBatteryAnalysis {
 
 function ExportReport {
 
-    $timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-    $reportPath = "$env:USERPROFILE\Desktop\ThinkPad_Report_$timestamp.txt"
-    $errorPath  = "$env:USERPROFILE\Desktop\ThinkPad_ErrorLog_$timestamp.txt"
+    # Resolve Documents via the Windows shell API (handles OneDrive redirection).
+    # Falls back to $env:USERPROFILE\Documents if the API returns empty.
+    $documentsPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+    if (-not $documentsPath -or -not (Test-Path $documentsPath)) {
+        $documentsPath = "$env:USERPROFILE\Documents"
+    }
+
+    # Dedicated subfolder — keeps reports out of both Desktop and Documents root.
+    # Created automatically on first run; subsequent runs reuse it.
+    $reportDir = Join-Path $documentsPath "ThinkPad Reports"
+    if (-not (Test-Path $reportDir)) {
+        New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+    }
+
+    $reportPath = Join-Path $reportDir "ThinkPad_Report.txt"
+    $errorPath  = Join-Path $reportDir "ThinkPad_ErrorLog.txt"
 
     [System.Collections.Generic.List[string]]$Report = @()
 
@@ -1856,14 +1864,15 @@ function ExportReport {
                                     elseif ($reportCycles -lt 500)   { "WARN" }
                                     else                             { "FAIL" }
 
-                    $genuineStatus = if ($classification.IsGenuine) { "PASS" } else { "WARN" }
+                    # DEPRECATED (v2.0): $genuineStatus always PASS — IsGenuine check removed.
+                    $genuineStatus = "INFO"
 
                     $Report += "  Battery $($index + 1)"
                     $Report += "  Manufacturer   : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })"
                     $Report += "  Health         : $($classification.HealthPercent)%  [$healthStatus]"
                     $Report += "  Cycle Count    : $(if ($reportCycles -gt 0) { "$reportCycles" } else { "N/A" })  [$cycleStatus]"
                     $Report += "  Rating         : $($classification.Classification)"
-                    $Report += "  Genuine        : $(if ($classification.IsGenuine) { "Yes" } else { "No" })  [$genuineStatus]"
+                    $Report += "  Manufacturer   : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })  [INFO]"
                     $Report += "  Summary        : $($classification.Message)"
                     $Report += ""
                     $index++
@@ -1982,7 +1991,11 @@ function ExportReport {
         Write-Host "  $errorPath"
     }
 
-    Read-Host "Press ENTER"
+    Write-Host ""
+    $open = Read-Host "Open folder now? [Y / ENTER to skip]"
+    if ($open.Trim().ToUpper() -eq "Y") {
+        Start-Process explorer.exe $reportDir
+    }
 }
 
 function Write-BatteryTrendLog {
