@@ -3033,10 +3033,8 @@ function Show-About {
     Write-Host "diagnostic purposes only. It makes no modifications" -ForegroundColor DarkGray
     Write-Host "to system configuration, firmware, or settings." -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "Lenovo is not responsible for the performance or" -ForegroundColor DarkGray
-    Write-Host "safety of unauthorized batteries, and provides no" -ForegroundColor DarkGray
-    Write-Host "warranties for failure or damage arising from" -ForegroundColor DarkGray
-    Write-Host "their use." -ForegroundColor DarkGray
+    Write-Host "Third-party battery replacements are a consumer" -ForegroundColor DarkGray
+    Write-Host "right under EU Battery Regulation (2027)." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "Battery age estimation results are statistical" -ForegroundColor DarkGray
     Write-Host "approximations. Actual age may vary based on usage" -ForegroundColor DarkGray
@@ -3054,9 +3052,9 @@ function Show-About {
     Write-Host "resolved via powercfg /batteryreport (Windows" -ForegroundColor DarkGray
     Write-Host "built-in utility) as a fallback data source." -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "Genuine manufacturer detection list sourced from" -ForegroundColor DarkGray
-    Write-Host "Lenovo Material Safety Data Sheets and ThinkPad" -ForegroundColor DarkGray
-    Write-Host "community hardware research." -ForegroundColor DarkGray
+    Write-Host "Battery manufacturer identification is provided" -ForegroundColor DarkGray
+    Write-Host "for informational purposes only. Third-party" -ForegroundColor DarkGray
+    Write-Host "replacements are a consumer right under EU law." -ForegroundColor DarkGray
     Write-Host ""
 
     Write-Host ("=" * 47)
