@@ -121,29 +121,21 @@ function New-ScriptCimSession {
 function Get-GenuineManufacturerList {
     <#
     .SYNOPSIS
-    Returns the list of known OEM battery manufacturer name tokens.
+    Returns the list of genuine battery manufacturer name tokens used for
+    non-genuine detection in Get-BatteryClassification.
 
     .DESCRIPTION
-    DEPRECATED — no longer used as a pass/fail gate in Get-BatteryClassification.
+    Tries to load the list from manufacturers.json in the same directory as
+    this script. If the file is missing, unreadable, or contains no entries,
+    falls back silently to the built-in hardcoded list so the script never
+    breaks due to a missing or malformed JSON file.
 
-    Historical context: This function was introduced when Lenovo actively enforced
-    a battery whitelist via BIOS firmware (circa 2016), blocking third-party cells
-    from charging. The "non-genuine" warning was intended to surface that lockdown
-    to users.
+    To extend detection without editing this script, add entries to the
+    genuineManufacturers array in manufacturers.json:
+      { "name": "NEWMFR", "fullName": "New Manufacturer Inc.", "region": "XX", "notes": "" }
 
-    As of EU Battery Regulation (Regulation (EU) 2023/1542, effective Feb 18 2027),
-    consumers have an explicit legal right to replace batteries with third-party
-    cells. Treating a non-OEM manufacturer name as a WARN or FAIL condition is
-    therefore inappropriate in an EU-facing tool.
-
-    This function is retained for reference and potential informational display
-    but must not be used to produce warnings, failures, or any output implying
-    a third-party battery is unsafe or non-compliant.
-
-    Scheduled for full removal in a future cleanup pass post-v2.0 release.
-
-    .NOTES
-    v2.0 — Deprecated. See GitHub Issue #1 (EU Compliance milestone).
+    The "name" field is matched case-insensitively as a substring against
+    BatteryStaticData.ManufactureName. Only the "name" field is required.
     #>
 
     # Built-in fallback list -- always used if JSON load fails for any reason
@@ -250,13 +242,20 @@ function Get-BatteryClassification {
         }
     }
 
-    # DEPRECATED (v2.0 — EU Compliance): Manufacturer allowlist check removed.
-    # Get-GenuineManufacturerList was previously used here to flag third-party
-    # batteries as non-genuine. Under EU Battery Regulation (effective Feb 18 2027)
-    # this is no longer appropriate — third-party replacements are a consumer right.
-    # $IsGenuine is preserved as $true to suppress legacy warning display sites
-    # that have not yet been removed. See GitHub Issue #1.
-    $IsGenuine = $true
+    # Detect non-genuine batteries
+    # Load manufacturer list from manufacturers.json (falls back to built-in list if missing)
+    $GenuineManufacturers = Get-GenuineManufacturerList
+    $IsGenuine = $false
+
+    if ($Manufacturer -and $Manufacturer -ne "Unknown" -and $Manufacturer -ne "N/A") {
+        $normalizedManufacturer = $Manufacturer.Trim().ToUpper()
+        foreach ($Genuine in $GenuineManufacturers) {
+            if ($normalizedManufacturer -match [regex]::Escape($Genuine.ToUpper())) {
+                $IsGenuine = $true
+                break
+            }
+        }
+    }
 
     # Parse cycle count
     [int64]$cycles = 0
@@ -307,9 +306,9 @@ function Get-BatteryClassification {
     }
 
     # Add genuineness warning to message
-    # DEPRECATED (v2.0): Non-genuine warning message suppressed.
-    # $IsGenuine is always $true — this block is inert and retained only until
-    # the IsGenuine field is fully removed from the return object in a future pass.
+    if (-not $IsGenuine) {
+        $Message += " Warning: The battery in use is not genuine Lenovo-made or authorized. Lenovo has no responsibility for the performance or safety of unauthorized batteries, and provides no warranties for failure or damage arising from their use."
+    }
 
     return [PSCustomObject]@{
         HealthPercent = $HealthPercent
@@ -803,7 +802,7 @@ function Show-Disclaimer {
     Write-Host ""
     Write-Host "This tool is not made by or affiliated with Lenovo. It is a free, independent diagnostic tool for personal use."
     Write-Host ""
-    Write-Host "Warranty note: Under EU Battery Regulation (effective Feb 2027), you have the right to replace batteries with third-party cells. This tool does not install anything or make any changes."
+    Write-Host "Warranty note: Using unauthorized replacement parts (such as non-genuine batteries) may affect your warranty coverage. This tool does not install anything or make any changes."
     Write-Host ""
     Write-Host ""
     Write-Host "You must accept to continue. You may exit without accepting if you do not agree."
@@ -1153,7 +1152,9 @@ function FullCharge {
                         Write-Host "  Summary              : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
 
-                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
+                        if (-not $classification.IsGenuine) {
+                            Write-Host "  WARNING: This battery may not be a genuine Lenovo battery" -ForegroundColor Red
+                        }
                         if ($classification.FailureFlag) {
                             Write-Host "  ALERT: Battery replacement needed immediately!" -ForegroundColor Red
                         }
@@ -1239,7 +1240,9 @@ function FullCharge {
                         Write-Host "Summary              : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
 
-                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
+                        if (-not $classification.IsGenuine) {
+                            Write-Host "WARNING: This battery may not be a genuine Lenovo battery" -ForegroundColor Red
+                        }
                         if ($classification.FailureFlag) {
                             Write-Host "ALERT: Battery replacement needed immediately!" -ForegroundColor Red
                         }
@@ -1445,7 +1448,9 @@ function ComprehensiveBatteryAnalysis {
                         Write-Host "Summary              : " -NoNewline
                         Write-Host $classification.Message -ForegroundColor $severityColor
                         
-                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
+                        if (-not $classification.IsGenuine) {
+                            Write-Host "WARNING: This battery may not be a genuine Lenovo battery" -ForegroundColor Red
+                        }
                         
                         if ($classification.FailureFlag) {
                             Write-Host "ALERT: Battery replacement needed immediately!" -ForegroundColor Red
@@ -1508,7 +1513,9 @@ function ComprehensiveBatteryAnalysis {
                         Write-Host $classification.Classification -ForegroundColor $severityColor
                         Write-Host "Status           : $status"
                         
-                        # DEPRECATED (v2.0): Non-genuine warning removed — EU Battery Regulation compliance.
+                        if (-not $classification.IsGenuine) {
+                            Write-Host "WARNING: This battery may not be a genuine Lenovo battery" -ForegroundColor Red
+                        }
                         
                         Write-Host ""
                     }
@@ -1740,8 +1747,7 @@ function ExportReport {
                         $Report += "  Manufacturer   : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })"
                         $Report += "  Health         : $($classification.HealthPercent)%"
                         $Report += "  Rating         : $($classification.Classification)"
-                        # DEPRECATED (v2.0): Genuine field removed from report — EU Battery Regulation compliance.
-                        $Report += "  Manufacturer   : $(if ($Manufacturer) { $Manufacturer } else { "Unknown" })  [INFO]"
+                        $Report += "  Genuine        : $(if ($classification.IsGenuine) { "Yes" } else { "No — may not be a genuine Lenovo battery" })"
                         $Report += "  Summary        : $($classification.Message)"
                         $Report += ""
                         
@@ -2472,8 +2478,8 @@ function Show-About {
     Write-Host "It makes no modifications to your device," -ForegroundColor DarkGray
     Write-Host "firmware, or settings." -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "Third-party battery replacements are a consumer" -ForegroundColor DarkGray
-    Write-Host "right under EU Battery Regulation (2027)." -ForegroundColor DarkGray
+    Write-Host "Lenovo is not responsible for the performance or" -ForegroundColor DarkGray
+    Write-Host "safety of non-genuine batteries." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "Battery age estimates are approximations only." -ForegroundColor DarkGray
     Write-Host "Actual age may vary based on usage and service history." -ForegroundColor DarkGray
