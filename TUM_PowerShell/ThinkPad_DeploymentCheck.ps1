@@ -127,6 +127,92 @@ function Get-CdrtData {
     return $result
 }
 
+function Get-BatterySerialMismatch {
+    <#
+    .SYNOPSIS
+    Compares battery serial numbers reported by Lenovo_Battery (EC firmware)
+    and Win32_Battery (ACPI layer) to detect barcode/serial mismatches.
+
+    .DESCRIPTION
+    Genuine OEM batteries report consistent serial numbers across both the
+    Lenovo EC WMI interface (root\Lenovo\Lenovo_Battery) and the standard
+    Windows ACPI battery interface (Win32_Battery). A mismatch between the
+    two may indicate a third-party replacement, a refurbished cell, or a
+    firmware/label inconsistency worth noting before deployment.
+
+    This check replaces the previous manufacturer name allowlist approach.
+    Under EU Battery Regulation (effective Feb 18 2027), third-party battery
+    replacements are a consumer right — the mismatch is surfaced as WARN
+    (informational flag) rather than FAIL, so buyers can make an informed
+    decision without the tool implying the battery is unsafe or defective.
+
+    Returns a PSCustomObject:
+      Available   : $true if both sources were readable
+      Mismatch    : $true if serials differ
+      ECSerial    : serial from Lenovo_Battery (EC layer)
+      ACPISerial  : serial from Win32_Battery (ACPI layer)
+      Detail      : human-readable summary string
+    #>
+    $result = [PSCustomObject]@{
+        Available  = $false
+        Mismatch   = $false
+        ECSerial   = $null
+        ACPISerial = $null
+        Detail     = "Unavailable"
+    }
+
+    # ── Source 1: EC layer via Lenovo_Battery ─────────────────────────────
+    $ecSerial = $null
+    try {
+        if ((Test-LenovoNamespace) -and (Test-WmiClass -Namespace "root\Lenovo" -ClassName "Lenovo_Battery")) {
+            $lbs = @(Get-CimInstance -CimSession $script:CimSession -Namespace root\Lenovo `
+                         -ClassName Lenovo_Battery -ErrorAction Stop)
+            if ($lbs -and $lbs.Count -gt 0) {
+                $raw = Get-SafeWmiProperty -Object $lbs[0] -PropertyName "BatteryID" -DefaultValue $null
+                if ($raw -and $raw -ne "Unavailable") {
+                    $ecSerial = $raw.ToString().Trim()
+                }
+            }
+        }
+    } catch {}
+
+    # ── Source 2: ACPI layer via Win32_Battery ────────────────────────────
+    $acpiSerial = $null
+    try {
+        $wb = Get-CimInstance -CimSession $script:CimSession -ClassName Win32_Battery `
+                  -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($wb) {
+            $raw = Get-SafeWmiProperty -Object $wb -PropertyName "DeviceID" -DefaultValue $null
+            if ($raw -and $raw -ne "Unavailable") {
+                $acpiSerial = $raw.ToString().Trim()
+            }
+        }
+    } catch {}
+
+    if (-not $ecSerial -and -not $acpiSerial) { return $result }
+
+    $result.Available  = $true
+    $result.ECSerial   = $ecSerial
+    $result.ACPISerial = $acpiSerial
+
+    # Normalise before comparison — strip whitespace, compare case-insensitively
+    $ecNorm   = if ($ecSerial)   { $ecSerial.ToUpper()   -replace '\s','' } else { "" }
+    $acpiNorm = if ($acpiSerial) { $acpiSerial.ToUpper() -replace '\s','' } else { "" }
+
+    if ($ecNorm -and $acpiNorm -and $ecNorm -ne $acpiNorm) {
+        $result.Mismatch = $true
+        $result.Detail   = "EC: $ecSerial  |  ACPI: $acpiSerial"
+    } elseif ($ecNorm -and $acpiNorm) {
+        $result.Detail = $ecSerial
+    } elseif ($ecNorm) {
+        $result.Detail = "$ecSerial (ACPI not available)"
+    } else {
+        $result.Detail = "$acpiSerial (EC not available)"
+    }
+
+    return $result
+}
+
 function Get-SystemInfo {
     $model = "Unknown"; $biosVersion = "Unknown"; $biosDate = "Unknown"
     try {
@@ -247,6 +333,32 @@ function Get-DeploymentResult {
         $checks["Shock / Thermal"] = [PSCustomObject]@{ Value = "Lenovo Vantage not installed — skipped"; Status = "INFO" }
     }
 
+    # ── Battery serial / barcode mismatch ────────────────────────────────
+    # Compares EC firmware serial (Lenovo_Battery) against ACPI serial
+    # (Win32_Battery). A mismatch may indicate a third-party replacement.
+    # Surfaced as WARN only — under EU Battery Regulation (effective
+    # Feb 18 2027) third-party replacements are a consumer right and must
+    # not be treated as a defect or deployment blocker.
+    $serialCheck = Get-BatterySerialMismatch
+    if ($serialCheck.Available) {
+        if ($serialCheck.Mismatch) {
+            $checks["Battery Serial"] = [PSCustomObject]@{
+                Value  = "Mismatch detected — may be third-party replacement  |  $($serialCheck.Detail)"
+                Status = "WARN"
+            }
+        } else {
+            $checks["Battery Serial"] = [PSCustomObject]@{
+                Value  = $serialCheck.Detail
+                Status = "PASS"
+            }
+        }
+    } else {
+        $checks["Battery Serial"] = [PSCustomObject]@{
+            Value  = "Unavailable"
+            Status = "INFO"
+        }
+    }
+
     # ── Verdict ───────────────────────────────────────────────────────────
     $anyWarn    = $checks.Values | Where-Object { $_.Status -eq "WARN" }
     $status     = if ($hardFail) { "NOT READY" } elseif ($anyWarn) { "REVIEW NEEDED" } else { "READY" }
@@ -303,9 +415,13 @@ Write-Host $result.Status -ForegroundColor $result.StatusColor
 Write-Host ""
 
 Write-Host "  Criteria:" -ForegroundColor DarkGray
-Write-Host "    PASS  Battery >= 80%,  Cycles < 300,  Memory matched" -ForegroundColor DarkGray
-Write-Host "    WARN  Battery 70-79%,  Cycles 300-499,  Memory mismatch" -ForegroundColor DarkGray
+Write-Host "    PASS  Battery >= 80%,  Cycles < 300,  Memory matched,  Serial consistent" -ForegroundColor DarkGray
+Write-Host "    WARN  Battery 70-79%,  Cycles 300-499,  Memory mismatch,  Serial mismatch (third-party)" -ForegroundColor DarkGray
 Write-Host "    FAIL  Battery < 70%,   Cycles >= 500" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Note: A battery serial mismatch indicates a possible third-party replacement." -ForegroundColor DarkGray
+Write-Host "  Under EU Battery Regulation (2027), third-party replacements are a consumer" -ForegroundColor DarkGray
+Write-Host "  right and are not treated as a defect. Verify battery condition independently." -ForegroundColor DarkGray
 Write-Host ""
 
 # ── Save report to Desktop ────────────────────────────────────────────────────
@@ -335,9 +451,13 @@ $lines += ""
 $lines += "  Result : $($result.Status)"
 $lines += ""
 $lines += "-----------------------------------------------"
-$lines += "  PASS  Battery >= 80%,  Cycles < 300,  Memory matched"
-$lines += "  WARN  Battery 70-79%,  Cycles 300-499,  Memory mismatch"
+$lines += "  PASS  Battery >= 80%,  Cycles < 300,  Memory matched,  Serial consistent"
+$lines += "  WARN  Battery 70-79%,  Cycles 300-499,  Memory mismatch,  Serial mismatch (third-party)"
 $lines += "  FAIL  Battery < 70%,   Cycles >= 500"
+$lines += ""
+$lines += "  Note: A battery serial mismatch indicates a possible third-party replacement."
+$lines += "  Under EU Battery Regulation (2027), third-party replacements are a consumer"
+$lines += "  right and are not treated as a defect. Verify battery condition independently."
 $lines += "-----------------------------------------------"
 
 $lines | Out-File $reportPath -Encoding UTF8 -Force
