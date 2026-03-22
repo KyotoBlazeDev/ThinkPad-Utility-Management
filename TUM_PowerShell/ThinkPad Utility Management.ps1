@@ -305,7 +305,7 @@ function Get-SystemInfo {
             $biosVersion = $bios.SMBIOSBIOSVersion
             # ReleaseDate is a CIM datetime — format to readable date
             if ($bios.ReleaseDate) {
-                $biosDate = ([System.Management.ManagementDateTimeConverter]::ToDateTime($bios.ReleaseDate)).ToString("yyyy-MM-dd")
+                $biosDate = $bios.ReleaseDate.ToString("yyyy-MM-dd")
             }
         }
     } catch {}

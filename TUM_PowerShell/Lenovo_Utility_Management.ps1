@@ -303,7 +303,7 @@ function Get-SystemInfo {
             $biosVersion = $bios.SMBIOSBIOSVersion
             # ReleaseDate is a CIM datetime — format to readable date
             if ($bios.ReleaseDate) {
-                $biosDate = ([System.Management.ManagementDateTimeConverter]::ToDateTime($bios.ReleaseDate)).ToString("yyyy-MM-dd")
+                $biosDate = $bios.ReleaseDate.ToString("yyyy-MM-dd")
             }
         }
     } catch {}
@@ -3431,8 +3431,7 @@ function Get-BiosUpdateInfo {
         # Decode raw bytes as UTF-8 explicitly -- Invoke-WebRequest may
         # misdetect encoding and return the UTF-8 BOM as garbage characters.
         # [System.Text.Encoding]::UTF8.GetString strips the BOM correctly.
-        $catalogContent = [System.Text.Encoding]::UTF8.GetString($response.RawContent[($response.RawContent.IndexOf([byte]0x3C))..($response.RawContent.Length - 1)])
-        [xml]$catalog = $catalogContent
+        [xml]$catalog = $response.Content
     }
     catch {
         $result.UnavailableReason = "Failed to fetch catalog ($catalogUrl): $($_.Exception.Message)"
@@ -3466,8 +3465,7 @@ function Get-BiosUpdateInfo {
         $pkgResponse = Invoke-WebRequest -Uri $pkgUrl -UseBasicParsing `
             -TimeoutSec 15 -ErrorAction Stop
         # Same UTF-8 BOM workaround as the catalog fetch above.
-        $pkgContent = [System.Text.Encoding]::UTF8.GetString($pkgResponse.RawContent[($pkgResponse.RawContent.IndexOf([byte]0x3C))..($pkgResponse.RawContent.Length - 1)])
-        [xml]$pkgXml = $pkgContent
+        [xml]$pkgXml = $pkgResponse.Content
     }
     catch {
         $result.UnavailableReason = "Failed to fetch BIOS package descriptor ($pkgUrl): $($_.Exception.Message)"
