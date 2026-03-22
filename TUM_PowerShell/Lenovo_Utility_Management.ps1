@@ -617,7 +617,7 @@ function Show-Header {
     $si  = Get-SystemInfo
     $sto = Get-StorageInfo
     Write-Host "==============================================="
-    Write-Host "      LENOVO DEVICE HEALTH CHECK  V.1.1.2"
+    Write-Host "      LENOVO DEVICE HEALTH CHECK  V.1.1.3"
     Write-Host "==============================================="
     Write-Host "Device  : $env:COMPUTERNAME"
     Write-Host "Model   : $($si.Model)"
@@ -2713,7 +2713,7 @@ function Show-About {
     Write-Host ""
 
     Write-Host "Lenovo Device Health Check" -ForegroundColor Cyan
-    Write-Host "Version 1.1.2" -ForegroundColor White
+    Write-Host "Version 1.1.3" -ForegroundColor White
     Write-Host ""
 
     Write-Host "Built with Windows PowerShell, ChatGPT GPT 5.4, and Claude Sonnet 4.6" -ForegroundColor DarkGray
@@ -3431,7 +3431,8 @@ function Get-BiosUpdateInfo {
         # Decode raw bytes as UTF-8 explicitly -- Invoke-WebRequest may
         # misdetect encoding and return the UTF-8 BOM as garbage characters.
         # [System.Text.Encoding]::UTF8.GetString strips the BOM correctly.
-        [xml]$catalog = $response.Content
+        $catalogString = $response.Content -replace '^ï»¿',''
+        [xml]$catalog = $catalogString
     }
     catch {
         $result.UnavailableReason = "Failed to fetch catalog ($catalogUrl): $($_.Exception.Message)"
@@ -3465,7 +3466,8 @@ function Get-BiosUpdateInfo {
         $pkgResponse = Invoke-WebRequest -Uri $pkgUrl -UseBasicParsing `
             -TimeoutSec 15 -ErrorAction Stop
         # Same UTF-8 BOM workaround as the catalog fetch above.
-        [xml]$pkgXml = $pkgResponse.Content
+        $pkgString = $pkgResponse.Content -replace '^ï»¿',''
+        [xml]$pkgXml = $pkgString
     }
     catch {
         $result.UnavailableReason = "Failed to fetch BIOS package descriptor ($pkgUrl): $($_.Exception.Message)"

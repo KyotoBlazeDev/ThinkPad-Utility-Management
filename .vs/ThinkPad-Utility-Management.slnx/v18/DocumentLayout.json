@@ -26,7 +26,7 @@
       "DocumentGroups": [
         {
           "DockedWidth": 200,
-          "SelectedChildIndex": 5,
+          "SelectedChildIndex": 4,
           "Children": [
             {
               "$type": "Bookmark",
@@ -41,29 +41,8 @@
               "Name": "ST:128:0:{1fc202d4-d401-403c-9834-5b218574bb67}"
             },
             {
-              "$type": "Document",
-              "DocumentIndex": 2,
-              "Title": "ThinkPad_DeploymentCheck.ps1",
-              "DocumentMoniker": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\ThinkPad_DeploymentCheck.ps1",
-              "RelativeDocumentMoniker": "TUM_PowerShell\\ThinkPad_DeploymentCheck.ps1",
-              "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\ThinkPad_DeploymentCheck.ps1",
-              "RelativeToolTip": "TUM_PowerShell\\ThinkPad_DeploymentCheck.ps1",
-              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
-              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
-              "WhenOpened": "2026-03-22T13:06:56.678Z",
-              "EditorCaption": ""
-            },
-            {
-              "$type": "Document",
-              "DocumentIndex": 3,
-              "Title": "README.md",
-              "DocumentMoniker": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\README.md",
-              "RelativeDocumentMoniker": "README.md",
-              "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\README.md",
-              "RelativeToolTip": "README.md",
-              "ViewState": "AgIAAIcBAAAAAAAAAAAAAI8BAABGAAAAAAAAAA==",
-              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001818|",
-              "WhenOpened": "2026-03-21T08:00:04.328Z"
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{1c4feeaa-4718-4aa9-859d-94ce25d182ba}"
             },
             {
               "$type": "Document",
@@ -73,7 +52,7 @@
               "RelativeDocumentMoniker": "TUM_PowerShell\\Lenovo_Utility_Management.ps1",
               "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\Lenovo_Utility_Management.ps1",
               "RelativeToolTip": "TUM_PowerShell\\Lenovo_Utility_Management.ps1",
-              "ViewState": "AgIAAK4OAAAAAAAAAADwv84OAAAXAAAAAAAAAA==",
+              "ViewState": "AgIAAK4OAAAAAAAAAAAAwMwOAAAXAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
               "WhenOpened": "2026-03-21T03:16:19.47Z",
               "EditorCaption": ""
@@ -86,10 +65,34 @@
               "RelativeDocumentMoniker": "TUM_PowerShell\\ThinkPad Utility Management.ps1",
               "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\ThinkPad Utility Management.ps1",
               "RelativeToolTip": "TUM_PowerShell\\ThinkPad Utility Management.ps1",
-              "ViewState": "AgIAACITAAAAAAAAAADwv0ITAAAXAAAAAAAAAA==",
+              "ViewState": "AgIAAMQIAAAAAAAAAAAUwEITAAAXAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
               "WhenOpened": "2026-03-21T03:16:10.427Z",
               "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 2,
+              "Title": "ThinkPad_DeploymentCheck.ps1",
+              "DocumentMoniker": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\ThinkPad_DeploymentCheck.ps1",
+              "RelativeDocumentMoniker": "TUM_PowerShell\\ThinkPad_DeploymentCheck.ps1",
+              "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\TUM_PowerShell\\ThinkPad_DeploymentCheck.ps1",
+              "RelativeToolTip": "TUM_PowerShell\\ThinkPad_DeploymentCheck.ps1",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
+              "WhenOpened": "2026-03-22T13:06:56.678Z"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 3,
+              "Title": "README.md",
+              "DocumentMoniker": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\README.md",
+              "RelativeDocumentMoniker": "README.md",
+              "ToolTip": "C:\\Users\\Felisitas\\source\\repos\\KyotoBlazeDev\\ThinkPad-Utility-Management\\README.md",
+              "RelativeToolTip": "README.md",
+              "ViewState": "AgIAAIcBAAAAAAAAAAAAAI8BAABGAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001818|",
+              "WhenOpened": "2026-03-21T08:00:04.328Z"
             }
           ]
         }
