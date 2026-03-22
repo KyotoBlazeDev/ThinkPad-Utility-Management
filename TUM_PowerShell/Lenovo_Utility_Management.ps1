@@ -352,7 +352,7 @@ function Get-StorageInfo {
             $script:StorageInfo = $result
             return $result
         }
-    } catch {}
+    } catch { Log-Error "root\microsoft\windows\storage" "MSFT_PhysicalDisk" $_ }
 
     # Fallback: Win32_DiskDrive (always present but lacks MediaType)
     try {
@@ -366,7 +366,7 @@ function Get-StorageInfo {
             $result.Model     = if ($drive.Model) { $drive.Model } else { "Unknown" }
             $result.Available = $true
         }
-    } catch {}
+    } catch { Log-Error "root\cimv2" "Win32_DiskDrive" $_ }
 
     $script:StorageInfo = $result
     return $result
@@ -531,7 +531,7 @@ function Get-BatteryAlertState {
                     return $script:BatteryAlert
                 }
             }
-        } catch {}
+        } catch { Log-Error "root\Lenovo" "Lenovo_Battery" $_ }
     }
 
     # ── Source 2: ACPI BatteryFullChargedCapacity ────────────────────────
@@ -570,7 +570,7 @@ function Get-BatteryAlertState {
                 $result.Available    = $true
             }
         }
-    } catch {}
+    } catch { Log-Error "root\wmi" "BatteryFullChargedCapacity" $_ }
 
     $script:BatteryAlert = Set-BatteryAlertSummary $result
     return $script:BatteryAlert
@@ -1792,6 +1792,9 @@ function Set-TrendLogInterval {
 
     $cfg["TrendLogInterval"] = $Interval.ToString("hh\:mm\:ss")
     $cfg | ConvertTo-Json -Depth 5 | Set-Content $configPath -Encoding UTF8
+
+    # Invalidate the in-memory cache so Write-BatteryTrendLog picks up the new value
+    $script:CachedLogInterval = $null
 }
 
 function Write-BatteryTrendLog {
@@ -1825,11 +1828,48 @@ function Write-BatteryTrendLog {
         # Load existing rows for duplicate suppression
         $existing = @()
         if (Test-Path $logPath) {
-            try { $existing = @(Import-Csv $logPath) } catch {}
+            try {
+                $raw = @(Import-Csv $logPath)
+                # Row-level schema validation — discard any row missing required columns.
+                # Protects against partial writes (script crash mid-append) and manual edits.
+                $existing = @($raw | Where-Object {
+                    $_.Timestamp -and $_.BatteryIndex -ne $null -and
+                    $_.FullCharge -and $_.DesignCapacity -and $_.HealthPct
+                })
+            } catch {}
         }
 
         $now = Get-Date
-        $logInterval = Get-TrendLogInterval
+
+        # Cache interval in script scope — avoids re-reading config.json on every
+        # run. Invalidated automatically when Set-TrendLogInterval writes a new value.
+        if (-not $script:CachedLogInterval) {
+            $script:CachedLogInterval = Get-TrendLogInterval
+        }
+        $logInterval = $script:CachedLogInterval
+
+        # Early exit — check all batteries against the interval BEFORE firing any
+        # WMI queries. If every battery was logged recently, skip all WMI work.
+        if ($existing.Count -gt 0) {
+            $batteryIndices = $existing | Select-Object -ExpandProperty BatteryIndex -Unique
+            $allRecent = $true
+            foreach ($bi in $batteryIndices) {
+                $recentCheck = $existing |
+                    Where-Object { $_.BatteryIndex -eq $bi } |
+                    Sort-Object { [datetime]::Parse($_.Timestamp) } |
+                    Select-Object -Last 1
+                if ($recentCheck) {
+                    try {
+                        $lastT = [datetime]::Parse($recentCheck.Timestamp)
+                        if (($now - $lastT) -ge ($logInterval - [TimeSpan]::FromMinutes(5))) {
+                            $allRecent = $false
+                            break
+                        }
+                    } catch { $allRecent = $false; break }
+                } else { $allRecent = $false; break }
+            }
+            if ($allRecent) { return }
+        }
 
         # Collect per-battery data from ACPI (always available, source-agnostic)
         $acpiBatteries = @(Get-WmiObject -Namespace root\wmi -Class BatteryFullChargedCapacity -ErrorAction SilentlyContinue)
@@ -1854,6 +1894,20 @@ function Write-BatteryTrendLog {
 
         for ($i = 0; $i -lt $acpiBatteries.Count; $i++) {
             try {
+                # ── Per-battery duplicate check — before any property reads ──
+                # Skip WMI property access entirely if this battery was logged recently.
+                $recentEntry = $existing |
+                    Where-Object { $_.BatteryIndex -eq $i } |
+                    Sort-Object { [datetime]::Parse($_.Timestamp) } |
+                    Select-Object -Last 1
+
+                if ($recentEntry) {
+                    try {
+                        $lastTime = [datetime]::Parse($recentEntry.Timestamp)
+                        if (($now - $lastTime) -lt ($logInterval - [TimeSpan]::FromMinutes(5))) { continue }
+                    } catch {}
+                }
+
                 [int64]$fc = 0
                 if (-not ([int64]::TryParse(
                     (Get-SafeWmiProperty -Object $acpiBatteries[$i] -PropertyName "FullChargedCapacity"),
@@ -1863,12 +1917,14 @@ function Write-BatteryTrendLog {
                 [int64]$dc = 0
                 if (-not ([int64]::TryParse(($dcRaw -replace '\D',''), [ref]$dc)) -or $dc -le 0) { continue }
 
-                # Cap at 100 — FullCharge can exceed DesignCapacity on some firmware
-                # (e.g. BYD L24B4PC0 reports ~85160 mWh against 80000 mWh design).
-                # Values above 100% are firmware noise, not genuine overcapacity.
-                $healthPct = [math]::Min([math]::Round(($fc / $dc) * 100, 2), 100.0)
+                # Store raw health percentage — do NOT cap here so the trend log
+                # preserves early-life overcapacity (102–105%) as a calibration signal.
+                # The display layer caps at 100% for the health classification display.
+                $healthPctRaw = [math]::Round(($fc / $dc) * 100, 2)
+                $healthPct    = $healthPctRaw
 
-                # Cycle count — prefer Lenovo_Battery, fall back to Lenovo_Odometer
+                # Cycle count — prefer Lenovo_Battery, fall back to Lenovo_Odometer,
+                # then Win32_Battery for systems without SIF (e.g. AMD/newer models).
                 $cycles = ""
                 if ($i -lt $lbBatteries.Count) {
                     $rawCyc = Get-SafeWmiProperty -Object $lbBatteries[$i] -PropertyName "CycleCount"
@@ -1878,6 +1934,19 @@ function Write-BatteryTrendLog {
                     [int64]$cyc = 0
                     if ([int64]::TryParse(([string]$odoObj.Battery_cycles -replace '\D',''), [ref]$cyc)) { $cycles = $cyc }
                 }
+                # Win32_Battery fallback — available on some ACPI-only systems
+                if ($cycles -eq "") {
+                    try {
+                        $w32b = @(Get-CimInstance -CimSession $script:CimSession -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+                        if ($w32b -and $i -lt $w32b.Count) {
+                            [int64]$cyc = 0
+                            $cyRaw = Get-SafeWmiProperty -Object $w32b[$i] -PropertyName "CycleCount" -DefaultValue $null
+                            if ($cyRaw -and [int64]::TryParse(($cyRaw -replace '\D',''), [ref]$cyc) -and $cyc -gt 0) {
+                                $cycles = $cyc
+                            }
+                        }
+                    } catch {}
+                }
 
                 # Battery ID from alert cache or fallback label
                 $batteryID = "Battery $i"
@@ -1886,17 +1955,37 @@ function Write-BatteryTrendLog {
                     if ($cachedID -and $cachedID -ne "Unavailable") { $batteryID = $cachedID }
                 }
 
-                # Duplicate suppression — skip if logged within user-configured interval
-                $recentEntry = $existing |
-                    Where-Object { $_.BatteryIndex -eq $i } |
-                    Sort-Object Timestamp |
-                    Select-Object -Last 1
+                # ── Data validation before writing ────────────────────────
+                # Single $lastEntry lookup reused for all validation checks below —
+                # avoids querying $existing three times per battery per run.
+                if ($fc -lt 100 -or $fc -gt 250000) { continue }
+                if ($dc -lt 100 -or $dc -gt 250000) { continue }
+                if ($healthPct -lt 1 -or $healthPct -gt 150) { continue }
 
-                if ($recentEntry) {
-                    try {
-                        $lastTime = [datetime]::Parse($recentEntry.Timestamp)
-                        if (($now - $lastTime) -lt $logInterval) { continue }
-                    } catch {}
+                $lastEntry = $recentEntry  # already fetched at top of loop
+                if ($lastEntry) {
+                    # Health swing check — >20% vs last entry = bad WMI read, skip
+                    [double]$lastHp = 0
+                    if ([double]::TryParse($lastEntry.HealthPct, [ref]$lastHp) -and $lastHp -gt 0) {
+                        if ([math]::Abs($healthPct - $lastHp) -gt 20) { continue }
+                    }
+
+                    # Design capacity consistency — DC should not change >5% between runs
+                    # (a large change means a battery swap or corrupt read)
+                    [int64]$lastDc = 0
+                    if ([int64]::TryParse($lastEntry.DesignCapacity, [ref]$lastDc) -and $lastDc -gt 0) {
+                        $dcDrift = [math]::Abs($dc - $lastDc) / $lastDc
+                        if ($dcDrift -gt 0.05) { continue }
+                    }
+
+                    # Cycle count regression — cycles must never decrease
+                    # A drop signals counter reset or battery swap; skip this reading
+                    if ($cycles -ne "" -and $lastEntry.CycleCount -ne "") {
+                        [int64]$lastCyc = 0; [int64]$thisCyc = 0
+                        if ([int64]::TryParse($lastEntry.CycleCount, [ref]$lastCyc) -and
+                            [int64]::TryParse([string]$cycles, [ref]$thisCyc) -and
+                            $thisCyc -lt $lastCyc) { continue }
+                    }
                 }
 
                 $newRows += [PSCustomObject]@{
@@ -1908,16 +1997,38 @@ function Write-BatteryTrendLog {
                     HealthPct      = $healthPct
                     CycleCount     = $cycles
                 }
-            } catch {}
+            } catch { Log-BatteryError "root\wmi" "BatteryFullChargedCapacity" $_ $i $null $null }
         }
 
         if ($newRows.Count -gt 0) {
-            $writeHeader = -not (Test-Path $logPath)
+            # Validate column structure before appending — if the existing CSV was
+            # written by an older version of the script with different columns, a
+            # silent append would produce a malformed file. Rebuild from scratch if
+            # the headers don't match exactly.
+            $expectedHeaders = @("Timestamp","BatteryIndex","BatteryID","FullCharge","DesignCapacity","HealthPct","CycleCount")
+            if (Test-Path $logPath) {
+                try {
+                    $headerLine = (Get-Content $logPath -TotalCount 1 -ErrorAction Stop) -replace '"',''
+                    $existingHeaders = $headerLine -split ','
+                    $headersMatch = ($existingHeaders.Count -eq $expectedHeaders.Count)
+                    if ($headersMatch) {
+                        for ($h = 0; $h -lt $expectedHeaders.Count; $h++) {
+                            if ($existingHeaders[$h].Trim() -ne $expectedHeaders[$h]) { $headersMatch = $false; break }
+                        }
+                    }
+                    if (-not $headersMatch) {
+                        # Headers mismatch — old format. Archive and start fresh.
+                        $archivePath = $logPath -replace '\.csv$', "_archive_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+                        Move-Item $logPath $archivePath -Force -ErrorAction SilentlyContinue
+                        Log-Error "filesystem" "battery_trend.csv header mismatch — archived to $archivePath" $null
+                    }
+                } catch {}
+            }
             $newRows | Export-Csv -Path $logPath -Append -NoTypeInformation -Force
-            # If file was just created, it already has a header. If appending to existing,
-            # Export-Csv -Append on PowerShell 5 doesn't re-write header — correct behaviour.
+            # Export-Csv -Append on PowerShell 5 does not re-write the header
+            # when appending to an existing file — correct behaviour.
         }
-    } catch {}
+    } catch { Log-Error "filesystem" "battery_trend.csv" $_ }
 }
 
 function Show-BatteryHealthTrend {
@@ -1978,7 +2089,7 @@ function Show-BatteryHealthTrend {
     }
 
     foreach ($idx in $indices) {
-        $battRows = @($rows | Where-Object { $_.BatteryIndex -eq $idx } | Sort-Object Timestamp)
+        $battRows = @($rows | Where-Object { $_.BatteryIndex -eq $idx } | Sort-Object { [datetime]::Parse($_.Timestamp) })
 
         $battID = $battRows[-1].BatteryID
         Write-Host "Battery: $battID" -ForegroundColor Cyan
@@ -1990,12 +2101,14 @@ function Show-BatteryHealthTrend {
         foreach ($row in $battRows) {
             [double]$hp = 0
             [double]::TryParse($row.HealthPct, [ref]$hp) | Out-Null
-            $color = if ($hp -ge 80) { "Green" } elseif ($hp -ge 70) { "Yellow" } elseif ($hp -ge 60) { "Magenta" } else { "Red" }
+            $color = if ($hp -gt 100) { "Cyan" } elseif ($hp -ge 80) { "Green" } elseif ($hp -ge 70) { "Yellow" } elseif ($hp -ge 60) { "Magenta" } else { "Red" }
             $cycleDisplay = if ($row.CycleCount) { $row.CycleCount } else { "N/A" }
+            $hpDisplay = if ($hp -gt 100) { "{0,7}%*" -f $row.HealthPct } else { "{0,7}% " -f $row.HealthPct }
             Write-Host ("  {0,-20} " -f $row.Timestamp) -NoNewline
-            Write-Host ("{0,7}% " -f $row.HealthPct) -ForegroundColor $color -NoNewline
+            Write-Host $hpDisplay -ForegroundColor $color -NoNewline
             Write-Host ("{0,8} {1,10}" -f $row.FullCharge, $cycleDisplay)
         }
+        # * = calibration headroom (>100% is normal early-life overcapacity, not an error)
 
         Write-Host ""
 
@@ -2018,15 +2131,18 @@ function Show-BatteryHealthTrend {
         $last  = $parsed[-1]
         $spanDays = ($last.Timestamp - $first.Timestamp).TotalDays
 
-        if ($spanDays -lt 1) {
+        $firstDate = $first.Timestamp.Date
+        $lastDate  = $last.Timestamp.Date
+
+        if ($firstDate -eq $lastDate) {
             Write-Host "  All records from the same day — come back tomorrow for trend data." -ForegroundColor DarkGray
             Write-Host ""
             continue
         }
 
-        if ($spanDays -lt 14) {
-            Write-Host "  Need at least 14 days of data for a reliable trend." -ForegroundColor DarkGray
-            Write-Host "  So far: $([math]::Round($spanDays)) days  ($($parsed.Count) records)" -ForegroundColor DarkGray
+        if ($spanDays -lt 3) {
+            Write-Host "  Early trend (low confidence — need more data)." -ForegroundColor DarkGray
+            Write-Host "  So far: $([math]::Round($spanDays, 1)) days  ($($parsed.Count) records)" -ForegroundColor DarkGray
             Write-Host "  Current Health   : " -NoNewline
             $hpColor = if ($last.HealthPct -ge 80) { "Green" } elseif ($last.HealthPct -ge 70) { "Yellow" } elseif ($last.HealthPct -ge 60) { "Magenta" } else { "Red" }
             Write-Host ("{0:N2}%" -f $last.HealthPct) -ForegroundColor $hpColor
@@ -2034,10 +2150,124 @@ function Show-BatteryHealthTrend {
             continue
         }
 
-        $totalDrop    = $first.HealthPct - $last.HealthPct
-        $dropPerDay   = $totalDrop / $spanDays
+        $confidence = if ($spanDays -ge 14) { "High confidence" } `
+                      elseif ($spanDays -ge 7) { "Medium confidence" } `
+                      else { "Low confidence — more data needed" }
+
+        # ── Recalibration detection ───────────────────────────────────────
+        # An upward jump of >=5% between consecutive entries indicates a
+        # battery replacement or BMS recalibration. The trend calculation
+        # must use only the most recent segment after the last jump —
+        # mixing pre- and post-replacement data produces a meaningless rate.
+        $recalibrationFound = $false
+        $recalibrationDate  = $null
+        $segmentStart       = 0
+
+        for ($ri = 1; $ri -lt $parsed.Count; $ri++) {
+            $jump = $parsed[$ri].HealthPct - $parsed[$ri - 1].HealthPct
+            if ($jump -ge 5) {
+                $recalibrationFound = $true
+                $recalibrationDate  = $parsed[$ri].Timestamp
+                $segmentStart       = $ri
+            }
+        }
+
+        if ($recalibrationFound) {
+            Write-Host "  ⚠ Recalibration detected : $($recalibrationDate.ToString('yyyy-MM-dd'))" -ForegroundColor Yellow
+            Write-Host "    Health jumped upward — analysis uses data from this point only." -ForegroundColor DarkGray
+            Write-Host ""
+            # Trim parsed to post-recalibration segment only
+            $parsed = @($parsed[$segmentStart..($parsed.Count - 1)])
+            if ($parsed.Count -lt 2) {
+                Write-Host "  Not enough post-recalibration data yet — run again on a different day." -ForegroundColor DarkGray
+                Write-Host ""
+                continue
+            }
+            $first    = $parsed[0]
+            $last     = $parsed[-1]
+            $spanDays = ($last.Timestamp - $first.Timestamp).TotalDays
+            $firstDate = $first.Timestamp.Date
+            $lastDate  = $last.Timestamp.Date
+            if ($firstDate -eq $lastDate) {
+                Write-Host "  Post-recalibration records all from same day — come back tomorrow." -ForegroundColor DarkGray
+                Write-Host ""
+                continue
+            }
+        }
+
+        # ── Least-squares linear regression ──────────────────────────────
+        # More accurate than first-to-last slope — uses all data points,
+        # which makes it outlier-resistant and stable with sparse data.
+        # x = days since first entry, y = HealthPct
+        $n       = $parsed.Count
+        $x0      = $parsed[0].Timestamp
+        $sumX    = 0.0; $sumY = 0.0; $sumXY = 0.0; $sumX2 = 0.0
+        foreach ($pt in $parsed) {
+            $x = ($pt.Timestamp - $x0).TotalDays
+            $y = $pt.HealthPct
+            $sumX  += $x;  $sumY  += $y
+            $sumXY += $x * $y;  $sumX2 += $x * $x
+        }
+        $denom = ($n * $sumX2 - $sumX * $sumX)
+        if ([math]::Abs($denom) -lt 1e-10) {
+            $dropPerDay = 0; $slope = 0
+        } else {
+            $slope      = ($n * $sumXY - $sumX * $sumY) / $denom
+            $dropPerDay = -$slope
+        }
         $dropPerMonth = [math]::Round($dropPerDay * 30.44, 2)
         $currentHP    = $last.HealthPct
+
+        # ── R² (coefficient of determination) ────────────────────────────
+        # Measures how well the regression line fits the data.
+        # R² near 1.0 = consistent linear degradation (high fit).
+        # R² near 0.0 = noisy/scattered data (low fit, rate unreliable).
+        $meanY = $sumY / $n
+        $intercept = ($meanY - $slope * ($sumX / $n))
+        $ssTot = 0.0; $ssRes = 0.0
+        foreach ($pt in $parsed) {
+            $x = ($pt.Timestamp - $x0).TotalDays
+            $yHat = $slope * $x + $intercept
+            $ssTot += ($pt.HealthPct - $meanY) * ($pt.HealthPct - $meanY)
+            $ssRes += ($pt.HealthPct - $yHat)  * ($pt.HealthPct - $yHat)
+        }
+        $r2 = if ($ssTot -lt 1e-10) { 1.0 } else { [math]::Round(1 - ($ssRes / $ssTot), 2) }
+
+        # Override confidence with R²-based label when data is sufficient
+        if ($n -ge 5) {
+            $confidence = if ($r2 -ge 0.85) { "High  (R²=$r2)" } `
+                          elseif ($r2 -ge 0.5) { "Medium  (R²=$r2)" } `
+                          else { "Low — scattered data  (R²=$r2)" }
+        }
+
+        # ── Acceleration detection ────────────────────────────────────────
+        # Split data in half and compare first-half vs second-half slope.
+        # If second-half rate is >50% higher = degradation is accelerating.
+        $accelerating = $false
+        if ($n -ge 6) {
+            $mid   = [int]($n / 2)
+            $half1 = @($parsed[0..($mid-1)])
+            $half2 = @($parsed[$mid..($n-1)])
+
+            foreach ($half in @($half1, $half2)) {
+                $hn = $half.Count; $hSumX = 0.0; $hSumY = 0.0; $hSumXY = 0.0; $hSumX2 = 0.0
+                foreach ($pt in $half) {
+                    $x = ($pt.Timestamp - $x0).TotalDays
+                    $hSumX += $x; $hSumY += $pt.HealthPct
+                    $hSumXY += $x * $pt.HealthPct; $hSumX2 += $x * $x
+                }
+                $hd = ($hn * $hSumX2 - $hSumX * $hSumX)
+                if ($half -eq $half1) {
+                    $slope1 = if ([math]::Abs($hd) -lt 1e-10) { 0 } else { ($hn * $hSumXY - $hSumX * $hSumY) / $hd }
+                } else {
+                    $slope2 = if ([math]::Abs($hd) -lt 1e-10) { 0 } else { ($hn * $hSumXY - $hSumX * $hSumY) / $hd }
+                }
+            }
+            # Both slopes negative = degrading; slope2 more negative = accelerating
+            if ($slope1 -lt 0 -and $slope2 -lt 0 -and $slope2 -lt ($slope1 * 1.5)) {
+                $accelerating = $true
+            }
+        }
 
         $rateColor = if ($dropPerMonth -le 1.5) { "Green" } elseif ($dropPerMonth -le 3.0) { "Yellow" } else { "Red" }
         $rateLabel = if ($dropPerMonth -le 1.5) { "Normal" } elseif ($dropPerMonth -le 3.0) { "Elevated" } else { "Accelerated" }
@@ -2045,6 +2275,11 @@ function Show-BatteryHealthTrend {
         Write-Host "  Wear Rate        : " -NoNewline
         Write-Host ("{0:N2}%/month  ({1})" -f $dropPerMonth, $rateLabel) -ForegroundColor $rateColor
 
+        if ($accelerating) {
+            Write-Host "  ⚠ Degradation is accelerating — rate is worsening over time." -ForegroundColor Yellow
+        }
+
+        Write-Host "  Confidence       : $confidence" -ForegroundColor DarkGray
         Write-Host "  Tracked for      : $([math]::Round($spanDays)) days  ($($parsed.Count) records)"
         Write-Host "  Current Health   : " -NoNewline
         $hpColor = if ($currentHP -ge 80) { "Green" } elseif ($currentHP -ge 70) { "Yellow" } elseif ($currentHP -ge 60) { "Magenta" } else { "Red" }
@@ -2153,13 +2388,13 @@ function Get-BatteryCapacityHistory {
                     CycleCount     = $cc
                 }
             }
-            catch {}
+            catch { Log-Error "powercfg" "batteryreport" $_ }
         }
 
         # Sort oldest first
-        $entries = $entries | Sort-Object Timestamp
+        $entries = $entries | Sort-Object { [datetime]$_.Timestamp }
     }
-    catch {}
+    catch { Log-Error "powercfg" "batteryreport XML parse" $_ }
 
     return $entries
 }
@@ -2985,7 +3220,7 @@ function Get-LenovoHealthScore {
                 $sources     += "Battery capacity"
             }
         }
-    } catch {}
+    } catch { Log-Error "root\wmi" "BatteryFullChargedCapacity (HealthScore)" $_ }
 
     $batteryScore = if ($null -ne $batteryPct) {
         [math]::Round(($batteryPct / 100) * 65, 1)
@@ -3029,7 +3264,7 @@ function Get-LenovoHealthScore {
             $memScore = 5
             $memNotes = "Single or soldered module — no penalty"
         }
-    } catch {}
+    } catch { Log-Error "root\cimv2" "Win32_PhysicalMemory (HealthScore)" $_ }
     $components["Memory"] = [PSCustomObject]@{
         Score    = $memScore
         MaxScore = 5
@@ -3184,7 +3419,7 @@ function Get-BiosUpdateInfo {
             $winSuffix = "Win11"
         }
     }
-    catch {}
+    catch { Log-Error "root\cimv2" "Win32_OperatingSystem (BiosUpdateCheck)" $_ }
 
     # ── Fetch catalog XML ─────────────────────────────────────────────────────
     $catalogUrl = "https://download.lenovo.com/catalog/$($result.MTM)_$winSuffix.xml"
@@ -3294,7 +3529,7 @@ function Get-BiosUpdateInfo {
             }
             $compared = $true
         }
-        catch {}
+        catch { Log-Error "BiosUpdateCheck" "version comparison" $_ }
     }
 
     # Fallback: plain string compare (catches identical strings)
